@@ -1,0 +1,12 @@
+# Replace the example hostname and directory with your own values.
+server {
+    listen 80;
+    server_name love.example.com;
+    root /var/www/heart;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+# Configure your domain certificate through your hosting panel or ACME client.
