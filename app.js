@@ -30,8 +30,16 @@
     const t = random(0, TAU), [x, y] = heartShape(t);
     const shell = i < counts.heart * .28;
     const r = shell ? random(.94, 1.025) : Math.sqrt(Math.random()) * .97;
+    const coreRadius = Math.hypot(x / 16, (y - 4) / 16) * r;
+    const centerDensity = Math.max(0, 1 - coreRadius / .34);
+    // Thin the interior center softly instead of letting layered points form
+    // a bright, perfectly balanced knot at the heart's visual midpoint.
+    if (!shell && Math.random() < .48 * centerDensity * centerDensity) continue;
+    const asymmetry = Math.max(0, 1 - coreRadius / .48);
+    const jitterX = random(-.13, .13) * asymmetry;
+    const jitterY = random(-.13, .13) * asymmetry;
     hearts.push({ x: x * r, y: (y - 4) * r + 4, z: random(-5, 5) * Math.sqrt(Math.max(0, 1 - r * r)),
-      t, r, phase: random(0, TAU), size: random(.8, 2), light: Math.random(),
+      t, r, phase: random(0, TAU), size: random(.8, 2), light: Math.random(), jitterX, jitterY,
       vx: random(-65, 65), vy: random(-55, 55), vz: random(-20, 20) });
   }
   for (let i = 0; i < counts.field; i++) {
@@ -171,8 +179,8 @@
     // A moving highlight wraps around the heart's volume and its bright rim.
     for (let i = 0; i < hearts.length; i++) {
       const p = hearts[i], wave = .5 + .5 * Math.sin(p.t * 3 - time * 1.6 + p.r * 4);
-      let x = p.x * beat + p.vx * burst + Math.sin(time * .7 + p.phase) * .12;
-      let y = (p.y - 4) * beat + 4 + p.vy * burst + Math.cos(time * .6 + p.phase) * .12;
+      let x = (p.x + p.jitterX) * beat + p.vx * burst + Math.sin(time * .7 + p.phase) * .12;
+      let y = (p.y - 4 + p.jitterY) * beat + 4 + p.vy * burst + Math.cos(time * .6 + p.phase) * .12;
       const z = p.z + p.vz * burst;
       const rx = x * co + z * si, rz = -x * si + z * co;
       const ry = y * coa - rz * sia, depth = y * sia + rz * coa, perspective = 85 / (85 - depth);
@@ -185,12 +193,14 @@
           x += dx / distance * touch * 19; y += dy / distance * touch * 19;
         }
       }
+      const centerRadius = Math.hypot((p.x + p.jitterX) / 16, (p.y + p.jitterY - 4) / 16);
+      const centerLight = .64 + .36 * Math.min(1, centerRadius / .38);
       const shine = p.light > .974;
-      const light = (.38 + p.light * .48) * (.75 + wave * .3) * (1 + depth * .035 + touch * .8);
+      const light = (.38 + p.light * .48) * (.75 + wave * .3) * centerLight * (1 + depth * .035 + touch * .8);
       const green = .14 + wave * .2 + (shine ? .43 : 0);
       const blue = .38 + wave * .25 + (shine ? .24 : 0);
       point(x, y, p.size * perspective * (shine ? 3.5 : 2.1), 1, green, blue, light);
-      if (i % 9 === 0) point(x, y, (15 + p.size * 8) * perspective, 1, .11, .4, light * .16, 1);
+      if (i % 9 === 0 && centerRadius > .3) point(x, y, (15 + p.size * 8) * perspective, 1, .11, .4, light * .16, 1);
       if (p.light > .995) point(x, y, 12 + wave * 7, 1, .73, .85, light * .85, 2);
     }
 
