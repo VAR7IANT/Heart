@@ -1,1 +1,68 @@
-:root{color-scheme:dark}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#06040c}body{background:radial-gradient(ellipse at 50% 46%,#3a092538 0%,#17091e25 36%,transparent 68%),radial-gradient(ellipse at 9% 30%,#29135a2d,transparent 48%),radial-gradient(ellipse at 93% 74%,#5012352b,transparent 44%),#06040c}#universe{position:fixed;inset:0;width:100%;height:100%;touch-action:manipulation}
+:root {
+  color-scheme: dark;
+  --void: #030102;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--void);
+  overscroll-behavior: none;
+}
+
+body {
+  /* Matches the first rendered frame, so there is no flash while loading. */
+  background: radial-gradient(ellipse at 50% 50%, #0e0205 0%, var(--void) 62%);
+}
+
+#heart {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.8s ease;
+}
+
+#heart:active {
+  cursor: grabbing;
+}
+
+.ready #heart {
+  opacity: 1;
+}
+
+.fallback {
+  display: none;
+  position: fixed;
+  inset: 0;
+  place-items: center;
+}
+
+.no-webgl #heart {
+  display: none;
+}
+
+.no-webgl .fallback {
+  display: grid;
+}
+
+.fallback-heart {
+  width: min(52vmin, 340px);
+  fill: #9c0c22;
+  will-change: transform;
+}

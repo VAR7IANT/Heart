@@ -1,304 +1,953 @@
+/*
+ * Particle heart — WebGL2 renderer.
+ *
+ * Pipeline
+ *   1. A static particle buffer is generated once on the CPU: points on (and
+ *      inside) a smooth implicit 3D heart surface, plus emitted aura and a
+ *      sparse field of distant embers.
+ *   2. All motion happens in the vertex shader: surface particles stream
+ *      along the skin following a divergence-free flow field and are
+ *      re-projected onto the surface analytically, aura particles are
+ *      advected outward, and every particle feels the lub-dub pressure wave.
+ *   3. Particles are blended additively into a half-float HDR target, so
+ *      overlap never clips or flickers. Rim lighting (Fresnel) keeps the
+ *      interior dark and the silhouette luminous.
+ *   4. A dual-filter bloom chain and an ACES tone map / vignette / dither
+ *      composite produce the final image.
+ */
 (() => {
   'use strict';
 
-  let canvas = document.getElementById('universe');
-  let gl = canvas.getContext('webgl', { alpha: true, antialias: false, depth: false, stencil: false });
-  let ctx, program, buffer, maxPointSize = 96, contextLost = false;
-  const motionPreference = matchMedia('(prefers-reduced-motion: reduce)');
-  const heartbeat = new window.HeartbeatAudio();
-  const TAU = Math.PI * 2;
-  const compact = innerWidth < 700;
-  let width = innerWidth, height = innerHeight, dpr = 1;
-  let time = 0, previous = 0, raf = 0, burstAt = -20;
-  let pointerX = width / 2, pointerY = height / 2, pointerActive = false;
-  let tiltX = 0, tiltY = 0, lastPointerSpark = 0;
-  const hearts = [], field = [], halo = [], streams = [], meteors = [], sparks = [];
-  const counts = gl
-    ? { heart: compact ? 6800 : 11800, field: compact ? 1500 : 3100, halo: compact ? 1000 : 2000, stream: compact ? 700 : 1400 }
-    : { heart: 2800, field: 550, halo: 300, stream: 250 };
-  const capacity = counts.heart * 2 + counts.field + counts.halo + counts.stream + 1800;
-  const vertices = new Float32Array(capacity * 8);
-  let used = 0;
-  const random = (a, b) => a + Math.random() * (b - a);
-  const wrap = value => ((value % 1) + 1) % 1;
+  const { HeartRhythm, HeartbeatAudio, beatShape } = window.Heartbeat;
+  const canvas = document.getElementById('heart');
+  const root = document.documentElement;
+  const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
+  const rhythm = new HeartRhythm();
+  const audio = new HeartbeatAudio();
 
-  function heartShape(t) {
-    return [16 * Math.sin(t) ** 3, -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) + 2];
-  }
+  const glOptions = {
+    alpha: false, antialias: false, depth: false, stencil: false,
+    premultipliedAlpha: false, preserveDrawingBuffer: false,
+    powerPreference: 'high-performance'
+  };
+  const gl = canvas.getContext('webgl2', glOptions);
+  if (!gl) return startFallback();
 
-  for (let i = 0; i < counts.heart; i++) {
-    const t = random(0, TAU), [x, y] = heartShape(t);
-    const shell = i < counts.heart * .28;
-    const r = shell ? random(.94, 1.025) : Math.sqrt(Math.random()) * .97;
-    const coreRadius = Math.hypot(x / 16, (y - 4) / 16) * r;
-    const centerDensity = Math.max(0, 1 - coreRadius / .34);
-    // Thin the interior center softly instead of letting layered points form
-    // a bright, perfectly balanced knot at the heart's visual midpoint.
-    if (!shell && Math.random() < .48 * centerDensity * centerDensity) continue;
-    const asymmetry = Math.max(0, 1 - coreRadius / .48);
-    const jitterX = random(-.13, .13) * asymmetry;
-    const jitterY = random(-.13, .13) * asymmetry;
-    hearts.push({ x: x * r, y: (y - 4) * r + 4, z: random(-5, 5) * Math.sqrt(Math.max(0, 1 - r * r)),
-      t, r, phase: random(0, TAU), size: random(.8, 2), light: Math.random(), jitterX, jitterY,
-      vx: random(-65, 65), vy: random(-55, 55), vz: random(-20, 20) });
-  }
-  for (let i = 0; i < counts.field; i++) {
-    field.push({ x: Math.random(), y: Math.random(), depth: Math.random(), phase: random(0, TAU),
-      speed: random(.002, .013), size: random(.7, 2.5), tint: Math.random(), bright: Math.random() });
-  }
-  for (let i = 0; i < counts.halo; i++) {
-    const t = random(0, TAU), [x, y] = heartShape(t), r = random(1.015, 1.33);
-    halo.push({ x: x * r + random(-1, 1), y: (y - 4) * r + 4 + random(-1, 1),
-      phase: random(0, TAU), radius: r, size: random(.8, 2.5), light: Math.random() });
-  }
-  for (let i = 0; i < counts.stream; i++) {
-    streams.push({ u: Math.random(), spread: random(-1, 1) * Math.random(), phase: random(0, TAU),
-      size: random(.6, 2), side: i % 2 });
-  }
-  for (let i = 0; i < (compact ? 3 : 5); i++) {
-    meteors.push({ offset: i * 2.4 + Math.random(), period: random(9, 16), x: Math.random(), y: random(.02, .7), length: random(100, 220) });
+  /* ------------------------------------------------------------------ *
+   * Heart geometry                                                     *
+   * ------------------------------------------------------------------ */
+
+  // Taubin's heart surface (x² + 9/4·y² + z² − 1)³ = z³·(x² + 9/80·y²),
+  // remapped so that model Y is up and model Z is depth. Taking the real
+  // cube root of both sides gives the same surface as
+  //     F = (x² + 9/4·y² + z² − 1) − z·∛(x² + 9/80·y²) = 0,
+  // whose gradient — unlike the classic sextic's — never vanishes along the
+  // heart's equator. That degeneracy is what produces the bright horizontal
+  // "seam" in naive renderings; with F, distances and normals are smooth.
+  const DEPTH = 1.1;   // slightly fuller than the classic surface
+  const LIFT = 0.118;  // centers the shape vertically
+
+  function field(X, Y, Z, out) {
+    const x = X, y = Z / DEPTH, z = Y + LIFT;
+    const s = x * x + 0.1125 * y * y;
+    const k = Math.cbrt(s), q = z / (3 * k * k + 1e-5);
+    out[0] = 2 * x * (1 - q);
+    out[1] = 2 * z - k;
+    out[2] = y * (4.5 - 0.225 * q) / DEPTH;
+    return x * x + 2.25 * y * y + z * z - 1 - z * k;
   }
 
-  function initializeGL() {
-    const compile = (type, source) => {
-      const shader = gl.createShader(type);
-      gl.shaderSource(shader, source);
-      gl.compileShader(shader);
-      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error('Shader compilation failed');
-      return shader;
+  function mulberry32(seed) {
+    return () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
-    const vertex = compile(gl.VERTEX_SHADER, `
-      attribute vec2 aPosition;
-      attribute float aSize;
-      attribute vec3 aColor;
-      attribute float aOpacity;
-      attribute float aKind;
-      varying vec3 vColor;
-      varying float vOpacity;
-      varying float vKind;
-      void main() {
-        gl_Position = vec4(aPosition, 0.0, 1.0);
-        gl_PointSize = aSize;
-        vColor = aColor; vOpacity = aOpacity; vKind = aKind;
-      }
-    `);
-    const fragment = compile(gl.FRAGMENT_SHADER, `
-      precision mediump float;
-      varying vec3 vColor;
-      varying float vOpacity;
-      varying float vKind;
-      void main() {
-        vec2 p = gl_PointCoord * 2.0 - 1.0;
-        float r = length(p);
-        if (r > 1.0) discard;
-        float edge = 1.0 - smoothstep(0.65, 1.0, r);
-        float light = (exp(-r*r*5.5)*0.65 + exp(-r*r*32.0)*0.65)*edge;
-        if (vKind > 0.5 && vKind < 1.5) light = exp(-r*r*3.8)*edge*0.5;
-        if (vKind > 1.5) {
-          float rays = pow(max(0.0,1.0-abs(p.x)),22.0)*pow(max(0.0,1.0-abs(p.y)),1.6)
-                     + pow(max(0.0,1.0-abs(p.y)),22.0)*pow(max(0.0,1.0-abs(p.x)),1.6);
-          light = (exp(-r*r*24.0) + rays*0.6)*edge;
-        }
-        gl_FragColor = vec4(vColor, min(1.0, light*vOpacity));
-      }
-    `);
-    program = gl.createProgram(); gl.attachShader(program, vertex); gl.attachShader(program, fragment);
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error('Shader link failed');
-    gl.deleteShader(vertex); gl.deleteShader(fragment); gl.useProgram(program);
-    buffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buffer); gl.bufferData(gl.ARRAY_BUFFER, vertices.byteLength, gl.DYNAMIC_DRAW);
-    for (const [name, size, offset] of [['aPosition', 2, 0], ['aSize', 1, 8], ['aColor', 3, 12], ['aOpacity', 1, 24], ['aKind', 1, 28]]) {
-      const attribute = gl.getAttribLocation(program, name);
-      gl.enableVertexAttribArray(attribute); gl.vertexAttribPointer(attribute, size, gl.FLOAT, false, 32, offset);
-    }
-    maxPointSize = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1];
-    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.clearColor(0, 0, 0, 0);
-    gl.viewport(0, 0, canvas.width, canvas.height);
   }
 
-  if (gl) {
-    try { initializeGL(); }
-    catch {
-      const replacement = canvas.cloneNode(false); canvas.replaceWith(replacement); canvas = replacement;
-      gl = null; ctx = canvas.getContext('2d');
-    }
-  } else ctx = canvas.getContext('2d');
+  const BOX = [1.2, 1.18, 0.78];
 
-  function point(x, y, size, red, green, blue, opacity = 1, kind = 0) {
-    if (used >= capacity || opacity < .008 || x < -100 || x > width + 100 || y < -100 || y > height + 100) return;
-    const n = used++ * 8;
-    vertices[n] = x / width * 2 - 1; vertices[n + 1] = 1 - y / height * 2;
-    vertices[n + 2] = Math.max(1, Math.min(maxPointSize, size * dpr));
-    vertices[n + 3] = red; vertices[n + 4] = green; vertices[n + 5] = blue;
-    vertices[n + 6] = opacity; vertices[n + 7] = kind;
+  /** Uniform points on the surface: uniform samples in a thin band are kept
+   *  only if their true distance to the surface (measured after Newton
+   *  projection) is inside the band, so the area density stays even all
+   *  the way into the cleft and the tip. */
+  function sampleSurface(count, rand) {
+    const grad = [0, 0, 0], normal = [0, 0, 0];
+    const out = new Float32Array(count * 6);
+    const band = 0.02;
+    let n = 0;
+    while (n < count) {
+      const x = (rand() * 2 - 1) * BOX[0];
+      const y = (rand() * 2 - 1) * BOX[1];
+      const z = (rand() * 2 - 1) * BOX[2];
+      let f = field(x, y, z, grad);
+      let gg = grad[0] * grad[0] + grad[1] * grad[1] + grad[2] * grad[2];
+      if (Math.abs(f) > band * 1.05 * Math.sqrt(gg)) continue;
+      let px = x, py = y, pz = z, converged = false;
+      for (let i = 0; i < 24 && gg > 1e-12; i++) {
+        const s = f / gg, sx = grad[0] * s, sy = grad[1] * s, sz = grad[2] * s;
+        px -= sx; py -= sy; pz -= sz;
+        if (sx * sx + sy * sy + sz * sz < 1e-12) { converged = true; break; }
+        f = field(px, py, pz, grad);
+        gg = grad[0] * grad[0] + grad[1] * grad[1] + grad[2] * grad[2];
+      }
+      if (!converged || Math.hypot(px - x, py - y, pz - z) > band) continue;
+      field(px, py, pz, grad);
+      const inv = 1 / Math.hypot(grad[0], grad[1], grad[2]);
+      normal[0] = grad[0] * inv; normal[1] = grad[1] * inv; normal[2] = grad[2] * inv;
+      const o = n++ * 6;
+      out[o] = px; out[o + 1] = py; out[o + 2] = pz;
+      out[o + 3] = normal[0]; out[o + 4] = normal[1]; out[o + 5] = normal[2];
+    }
+    return out;
   }
 
-  function draw() {
-    if (contextLost) return;
-    used = 0;
-    const scale = Math.min(width * .0245, height * .0245), cx = width / 2, cy = height / 2 - 4.5 * scale;
-    const elapsed = time - burstAt;
-    const burst = elapsed >= 0 && elapsed < 4.2 ? Math.sin(Math.PI * elapsed / 4.2) ** 2 * Math.exp(-elapsed * .36) : 0;
-    const pulsePhase = heartbeat.phase(time);
-    const pulse = Math.exp(-(((pulsePhase - .12) / .09) ** 2)) + .48 * Math.exp(-(((pulsePhase - .32) / .08) ** 2));
-    const beat = 1 + pulse * .034;
-    const ay = Math.sin(time * .24) * .17 + tiltY, ax = tiltX;
-    const co = Math.cos(ay), si = Math.sin(ay), coa = Math.cos(ax), sia = Math.sin(ax);
+  // Per particle: position (3), normal (3), data (4: seed, kind, a, b).
+  const STRIDE = 10;
+  const KIND = { surface: 0, interior: 1, aura: 2, ember: 3 };
 
-    // A full-screen field at three depths keeps the edges alive.
-    for (const p of field) {
-      const x = wrap(p.x + Math.sin(time * .07 + p.phase) * .016 + time * p.speed * .12) * width;
-      const y = wrap(p.y - time * p.speed * .32) * height;
-      const twinkle = .3 + .7 * (.5 + .5 * Math.sin(time * (1 + p.depth) + p.phase)) ** 4;
-      const front = p.depth > .92;
-      const size = front ? 5 + p.size * 4 : p.size * (1 + p.depth);
-      const sideLight = .65 + .35 * Math.min(1, Math.abs(x - cx) / (width * .32));
-      const alpha = (front ? .2 : .27 + p.depth * .32) * twinkle * sideLight;
-      point(x, y, size, .65 + p.tint * .35, .32 + p.tint * .22, .78 + p.tint * .18, alpha, front ? 1 : 0);
-      if (p.bright > .984) point(x, y, 11 + twinkle * 9, .86, .73, 1, twinkle * .8, 2);
+  function buildParticles(total) {
+    const rand = mulberry32(0x5eed1e);
+    const counts = {
+      surface: Math.round(total * 0.6),
+      interior: Math.round(total * 0.15),
+      aura: Math.round(total * 0.24)
+    };
+    counts.ember = total - counts.surface - counts.interior - counts.aura;
+    const surface = sampleSurface(counts.surface, rand);
+    const data = new Float32Array(total * STRIDE);
+    let n = 0;
+    const push = (x, y, z, nx, ny, nz, kind, a, b) => {
+      const o = n++ * STRIDE;
+      data[o] = x; data[o + 1] = y; data[o + 2] = z;
+      data[o + 3] = nx; data[o + 4] = ny; data[o + 5] = nz;
+      data[o + 6] = rand(); data[o + 7] = kind; data[o + 8] = a; data[o + 9] = b;
+    };
+
+    for (let i = 0; i < counts.surface; i++) {
+      const o = i * 6;
+      push(surface[o], surface[o + 1], surface[o + 2], surface[o + 3], surface[o + 4], surface[o + 5],
+        KIND.surface, rand(), rand());
     }
 
-    // Two broad, softly scattered streams curl behind the heart.
-    for (const p of streams) {
-      const u = wrap(p.u + time * .009 * (p.side ? -1 : 1));
-      const x = u * width * 1.2 - width * .1;
-      const wave = Math.sin(u * TAU * .85 + p.side * Math.PI + time * .05);
-      const y = height * (.5 + wave * .23) + p.spread * height * .115;
-      const alpha = (.15 + .26 * (1 - Math.abs(p.spread))) * (.7 + .3 * Math.sin(p.phase + time));
-      point(x, y, p.size * 1.7, p.side ? .56 : 1, .25, p.side ? 1 : .58, alpha);
+    // Interior: denser just beneath the skin, sparse at the core.
+    const grad = [0, 0, 0];
+    for (let i = 0; i < counts.interior;) {
+      const x = (rand() * 2 - 1) * BOX[0], y = (rand() * 2 - 1) * BOX[1], z = (rand() * 2 - 1) * BOX[2];
+      const f = field(x, y, z, grad);
+      if (f >= 0) continue;
+      const len = Math.hypot(grad[0], grad[1], grad[2]) + 1e-6;
+      const depth = Math.min(1, -f / len / 0.35);
+      if (rand() > 0.25 + 0.75 * Math.exp(-depth * 3)) continue;
+      push(x, y, z, grad[0] / len, grad[1] / len, grad[2] / len, KIND.interior, rand(), depth);
+      i++;
     }
 
-    for (const p of halo) {
-      const drift = 1 + .024 * Math.sin(time * .7 + p.phase);
-      const x = cx + (p.x * drift * co + Math.sin(p.phase + time * .3)) * scale;
-      const y = cy + (p.y * drift + Math.cos(p.phase + time * .4) * .7) * scale;
-      const alpha = (1.45 - p.radius) * (.35 + p.light * .5) * (1 + pulse * .3);
-      point(x, y, p.size * 2, 1, .19 + p.light * .2, .5 + p.light * .25, alpha);
+    // Aura: emitted from random surface points.
+    for (let i = 0; i < counts.aura; i++) {
+      const o = Math.floor(rand() * counts.surface) * 6;
+      push(surface[o], surface[o + 1], surface[o + 2], surface[o + 3], surface[o + 4], surface[o + 5],
+        KIND.aura, rand(), rand());
     }
 
-    // A moving highlight wraps around the heart's volume and its bright rim.
-    for (let i = 0; i < hearts.length; i++) {
-      const p = hearts[i], wave = .5 + .5 * Math.sin(p.t * 3 - time * 1.6 + p.r * 4);
-      let x = (p.x + p.jitterX) * beat + p.vx * burst + Math.sin(time * .7 + p.phase) * .12;
-      let y = (p.y - 4 + p.jitterY) * beat + 4 + p.vy * burst + Math.cos(time * .6 + p.phase) * .12;
-      const z = p.z + p.vz * burst;
-      const rx = x * co + z * si, rz = -x * si + z * co;
-      const ry = y * coa - rz * sia, depth = y * sia + rz * coa, perspective = 85 / (85 - depth);
-      x = cx + rx * scale * perspective; y = cy + ry * scale * perspective;
-      let touch = 0;
-      if (pointerActive && !motionPreference.matches) {
-        const dx = x - pointerX, dy = y - pointerY, distance = Math.hypot(dx, dy);
-        if (distance < 130 && distance > 1) {
-          touch = (1 - distance / 130) ** 2;
-          x += dx / distance * touch * 19; y += dy / distance * touch * 19;
+    // Embers: a sparse, deep volume around the heart.
+    for (let i = 0; i < counts.ember; i++) {
+      const u = rand() * 2 - 1, phi = rand() * Math.PI * 2, s = Math.sqrt(1 - u * u);
+      const r = 1.7 + Math.pow(rand(), 0.7) * 3.6;
+      push(Math.cos(phi) * s * r * 1.5, u * r * 0.85, Math.sin(phi) * s * r - 1.2,
+        0, 1, 0, KIND.ember, rand(), rand());
+    }
+
+    // Global shuffle (so reduced draw counts keep every layer's ratio).
+    const swap = new Float32Array(STRIDE);
+    for (let i = total - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      swap.set(data.subarray(i * STRIDE, i * STRIDE + STRIDE));
+      data.copyWithin(i * STRIDE, j * STRIDE, j * STRIDE + STRIDE);
+      data.set(swap, j * STRIDE);
+    }
+    return data;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Shaders                                                            *
+   * ------------------------------------------------------------------ */
+
+  const COMMON = `
+    float pulse(float x, float tau) {
+      x = max(x, 0.0);
+      float u = x / (2.0 * tau);
+      return u * u * exp(2.0 - x / tau);
+    }
+    float beatAt(float age) { return pulse(age, 0.045) + 0.56 * pulse(age - 0.30, 0.04); }
+  `;
+
+  const PARTICLE_VS = `#version 300 es
+    precision highp float;
+    layout(location = 0) in vec3 aPos;
+    layout(location = 1) in vec3 aNormal;
+    layout(location = 2) in vec4 aData;   // seed, kind, a, b
+
+    uniform mat4 uViewProj;
+    uniform mat3 uModel;
+    uniform vec3 uOffset;
+    uniform vec3 uCamera;
+    uniform float uTime;
+    uniform vec2 uBeatAge;
+    uniform float uIntro;
+    uniform float uFocal;
+    uniform float uFocus;
+    uniform float uMaxSize;
+    uniform float uSize;
+    uniform float uGain;
+    uniform vec4 uRay;        // pointer ray direction (xyz), presence (w)
+    uniform vec4 uRipple;     // ripple ray direction (xyz), age (w)
+
+    out vec3 vColor;
+    out float vSoft;
+
+    ${COMMON}
+    float beat(float delay) { return beatAt(uBeatAge.x - delay) + beatAt(uBeatAge.y - delay); }
+
+    // Divergence-free (ABC-style) flow: each component ignores its own axis.
+    vec3 flow(vec3 p, float t) {
+      vec3 q = p * 1.6 + vec3(t * 0.11, t * 0.07, -t * 0.09);
+      vec3 v = vec3(sin(q.z) + cos(q.y), sin(q.x) + cos(q.z), sin(q.y) + cos(q.x));
+      vec3 r = p * 3.7 + vec3(-t * 0.17, t * 0.13, t * 0.05);
+      v += 0.45 * vec3(sin(r.y + 1.3) + cos(r.z), sin(r.z + 2.1) + cos(r.x), sin(r.x + 0.7) + cos(r.y));
+      return v;
+    }
+
+    const float DEPTH = ${DEPTH.toFixed(4)};
+    const float LIFT = ${LIFT.toFixed(4)};
+    vec4 heart(vec3 P) {
+      float x = P.x, y = P.z / DEPTH, z = P.y + LIFT;
+      float k = pow(x * x + 0.1125 * y * y, 1.0 / 3.0);
+      float q = z / (3.0 * k * k + 1e-5);
+      return vec4(2.0 * x * (1.0 - q), 2.0 * z - k, y * (4.5 - 0.225 * q) / DEPTH,
+                  x * x + 2.25 * y * y + z * z - 1.0 - z * k);
+    }
+
+    vec3 hash3(float s) {
+      return fract(sin(vec3(s * 127.1, s * 311.7, s * 74.7)) * 43758.5453) * 2.0 - 1.0;
+    }
+
+    void main() {
+      float seed = aData.x, kind = aData.y, ra = aData.z, rb = aData.w;
+      vec3 p = aPos, n = aNormal;
+      float alpha = 1.0, size = 1.0, sharp = 4.0;
+      float t = uTime;
+      vec3 col;
+      float wave = 0.0;
+      float coreDist = length(aPos * vec3(1.0, 1.0, 1.3));
+
+      if (kind < 0.5) {
+        // Surface: stream along the skin, then snap back onto it.
+        float life = 6.0 + 6.0 * ra;
+        float age = fract(t / life + seed);
+        float travel = age * (0.08 + 0.1 * rb);
+        for (int i = 0; i < 3; i++) {
+          vec3 v = flow(p, t * 0.25);
+          v -= n * dot(v, n);
+          p += v * (travel / 3.0) * 0.5;
+          vec4 h = heart(p);
+          float gg = dot(h.xyz, h.xyz);
+          // Newton step back onto the surface.
+          if (gg > 1e-6) { p -= h.xyz * (h.w / gg); n = h.xyz * inversesqrt(gg); }
         }
+        p -= n * rb * rb * 0.045;
+        alpha = smoothstep(0.0, 0.18, age) * smoothstep(1.0, 0.72, age);
+        size = 0.75 + 0.6 * ra;
+      } else if (kind < 1.5) {
+        // Interior: slow, deep drift.
+        p += flow(p * 0.8, t * 0.2) * 0.022;
+        size = 0.9 + 0.8 * ra;
+        sharp = 3.0;
+      } else if (kind < 2.5) {
+        // Aura: lifted off the surface and carried outward by the flow.
+        float life = 2.8 + 2.6 * ra;
+        float age = fract(t / life + seed);
+        float dist = age * (0.22 + 0.3 * rb);
+        for (int i = 0; i < 4; i++) {
+          vec3 v = n * 1.1 + flow(p * 0.9, t * 0.3) * 0.5 + vec3(0.0, 0.12, 0.0);
+          p += v * (dist / 4.0);
+        }
+        alpha = smoothstep(0.0, 0.1, age) * pow(1.0 - age, 2.2);
+        size = 0.85 + 0.9 * ra + age * 0.8;
+        sharp = 3.2;
+        wave = age;
+      } else {
+        // Embers: distant, slow and softly out of focus.
+        float life = 14.0 + 10.0 * ra;
+        float age = fract(t / life + seed);
+        p += flow(p * 0.3, t * 0.05) * 0.22 + vec3(0.0, (age - 0.5) * 0.9, 0.0);
+        alpha = sin(3.14159 * age);
+        size = 1.0 + 1.6 * rb;
+        sharp = 2.6;
       }
-      const centerRadius = Math.hypot((p.x + p.jitterX) / 16, (p.y + p.jitterY - 4) / 16);
-      const centerLight = .64 + .36 * Math.min(1, centerRadius / .38);
-      const shine = p.light > .974;
-      const light = (.38 + p.light * .48) * (.75 + wave * .3) * centerLight * (1 + depth * .035 + touch * .8);
-      const green = .14 + wave * .2 + (shine ? .43 : 0);
-      const blue = .38 + wave * .25 + (shine ? .24 : 0);
-      point(x, y, p.size * perspective * (shine ? 3.5 : 2.1), 1, green, blue, light);
-      if (i % 9 === 0 && centerRadius > .3) point(x, y, (15 + p.size * 8) * perspective, 1, .11, .4, light * .16, 1);
-      if (p.light > .995) point(x, y, 12 + wave * 7, 1, .73, .85, light * .85, 2);
-    }
 
-    // Independent schedules produce occasional diagonal shooting stars.
-    for (const m of meteors) {
-      const age = (time + m.offset) % m.period;
-      if (age > 1.7) continue;
-      const cycle = Math.floor((time + m.offset) / m.period);
-      const x = wrap(m.x + cycle * .3819) * width + age * width * .3;
-      const y = wrap(m.y + cycle * .217) * height * .75 + age * height * .19;
-      const fade = Math.sin(age / 1.7 * Math.PI);
-      for (let j = 0; j < 40; j++) {
-        const f = j / 40;
-        point(x - f * m.length, y - f * m.length * .52, 1.5 + (1 - f) * 2.5, .92, .63, 1, (1 - f) ** 2 * fade * .75);
+      // Lub-dub: a pressure wave from the core outward (core moves first).
+      float b = beat(coreDist * 0.06 + (kind > 1.5 && kind < 2.5 ? wave * 0.25 : 0.0));
+      float scale = 1.0 + 0.068 * b + 0.006 * sin(t * 0.55);
+      if (kind < 2.5) {
+        p *= scale;
+        p.y -= 0.012 * b;
+        float twist = 0.05 * b * p.y;
+        p.xz = mat2(cos(twist), -sin(twist), sin(twist), cos(twist)) * p.xz;
+        if (kind > 1.5) p += n * b * 0.07 * (1.0 - wave);
       }
-      point(x, y, 13, 1, .85, 1, fade, 2);
-    }
 
-    // A click sends a wave through the surrounding dust as the heart opens.
-    if (elapsed >= 0 && elapsed < 2.8) {
-      const radius = elapsed * Math.max(width, height) * .43;
-      const alpha = Math.max(0, 1 - elapsed / 2.8) ** 2;
-      for (let i = 0; i < 480; i++) {
-        const angle = i / 480 * TAU, scatter = Math.sin(i * 34.7) * 9;
-        point(cx + Math.cos(angle) * (radius + scatter), height / 2 + Math.sin(angle) * (radius + scatter), 2.3, 1, .37, .7, alpha * .75);
+      // Intro: particles gather from a wide, swirling cloud.
+      float k = clamp(uIntro * 1.55 - seed * 0.55, 0.0, 1.0);
+      k = k * k * (3.0 - 2.0 * k);
+      if (k < 1.0) {
+        vec3 far = aPos * (2.4 + 1.8 * ra) + hash3(seed) * 1.4 + flow(aPos, seed * 10.0) * 0.4;
+        p = mix(far, p, k);
+        alpha *= k;
       }
-    }
-    for (let i = sparks.length - 1; i >= 0; i--) {
-      const p = sparks[i], age = time - p.born;
-      if (age > 1.8) { sparks.splice(i, 1); continue; }
-      const fade = (1 - age / 1.8) ** 2;
-      point(p.x + p.vx * age, p.y + p.vy * age + age * age * 15, p.size * (1 + age), 1, .55, .8, fade, p.star ? 2 : 0);
-    }
 
-    if (gl) {
-      gl.clear(gl.COLOR_BUFFER_BIT); gl.bufferSubData(gl.ARRAY_BUFFER, 0, vertices.subarray(0, used * 8)); gl.drawArrays(gl.POINTS, 0, used);
-    } else if (ctx) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.globalCompositeOperation = 'lighter';
-      const step = hearts.length > 3000 ? 3 : 1;
-      for (let i = 0; i < used; i += step) {
-        const n = i * 8, glow = vertices[n + 7] === 1;
-        ctx.globalAlpha = Math.min(1, vertices[n + 6] * (glow ? .13 : .8));
-        ctx.fillStyle = `rgb(${Math.round(vertices[n + 3] * 255)},${Math.round(vertices[n + 4] * 255)},${Math.round(vertices[n + 5] * 255)})`;
-        ctx.beginPath(); ctx.arc((vertices[n] + 1) / 2 * canvas.width, (1 - vertices[n + 1]) / 2 * canvas.height, vertices[n + 2] * .3, 0, TAU); ctx.fill();
+      vec3 world = uModel * p + uOffset;
+
+      // Pointer: particles near the pointer ray part gently, and a tap sends
+      // a soft ring outward around it.
+      vec3 rel = world - uCamera;
+      float glow = 0.0;
+      if (uRay.w > 0.001) {
+        vec3 perp = rel - uRay.xyz * dot(rel, uRay.xyz);
+        float d2 = dot(perp, perp);
+        float f = exp(-d2 / 0.07) * uRay.w;
+        world += perp * inversesqrt(d2 + 1e-4) * f * 0.05;
+        glow += f * 0.45;
       }
-      ctx.globalAlpha = 1;
+      if (uRipple.w < 2.5) {
+        vec3 perp = rel - uRipple.xyz * dot(rel, uRipple.xyz);
+        float d = length(perp);
+        float ring = d - uRipple.w * 1.5;
+        float f = exp(-ring * ring / 0.02) * exp(-uRipple.w * 1.6);
+        world += perp / (d + 1e-3) * f * 0.06;
+        glow += f * 0.9;
+      }
+
+      // Shading.
+      vec3 N = normalize(uModel * n);
+      vec3 V = normalize(uCamera - world);
+      float ndv = dot(N, V);
+      float fres = 1.0 - abs(ndv);
+      vec3 deep = vec3(0.24, 0.006, 0.018);
+      vec3 crimson = vec3(1.0, 0.028, 0.045);
+      vec3 hot = vec3(1.0, 0.22, 0.12);
+      float energy;
+      if (kind < 0.5) {
+        float rim = pow(fres, 2.6);
+        float facing = mix(0.42, 1.0, smoothstep(-0.35, 0.35, ndv));
+        vec3 L = normalize(vec3(-0.55, 0.65, 0.55));
+        float spec = pow(max(dot(reflect(-L, N), V), 0.0), 5.0) * smoothstep(0.0, 0.3, ndv);
+        float key = max(dot(N, L), 0.0);
+        energy = (0.02 + key * key * 0.05 + rim * (2.1 + 1.6 * b) + spec * 0.16) * facing;
+        col = mix(deep, crimson, smoothstep(0.0, 0.55, rim + spec)) * energy
+            + hot * pow(rim, 5.0) * (0.35 + 1.1 * b) * facing;
+      } else if (kind < 1.5) {
+        energy = (0.034 + 0.04 * b) * (1.0 - 0.6 * rb);
+        col = vec3(0.4, 0.012, 0.03) * energy;
+      } else if (kind < 2.5) {
+        energy = (0.3 + 0.5 * b) * (0.12 + 0.88 * pow(fres, 2.0));
+        col = mix(crimson, deep, wave) * energy;
+      } else {
+        col = vec3(0.7, 0.05, 0.07) * 0.16;
+      }
+      col *= 1.0 + glow;
+
+      gl_Position = uViewProj * vec4(world, 1.0);
+      float w = max(gl_Position.w, 0.05);
+
+      // Size in pixels, with depth-of-field blur and energy conservation.
+      float px = size * uSize * uFocal / w;
+      float coc = abs(w - uFocus) * uFocal * 0.0024;
+      float blurred = sqrt(px * px + coc * coc);
+      float energyScale = (px * px) / (blurred * blurred);
+      px = blurred;
+      // Sub-pixel points are widened instead of shrunk: no shimmer.
+      float minPx = 1.4;
+      if (px < minPx) { energyScale *= (px * px) / (minPx * minPx); px = minPx; }
+      if (px > uMaxSize) { energyScale *= (px * px) / (uMaxSize * uMaxSize); px = uMaxSize; }
+      gl_PointSize = px;
+      vColor = col * alpha * energyScale * uGain;
+      vSoft = mix(sharp, 2.2, clamp(coc / (coc + px * 0.5 + 1.0), 0.0, 1.0));
     }
+  `;
+
+  const PARTICLE_FS = `#version 300 es
+    precision mediump float;
+    in vec3 vColor;
+    in float vSoft;
+    out vec4 outColor;
+    void main() {
+      vec2 c = gl_PointCoord * 2.0 - 1.0;
+      float r2 = dot(c, c);
+      float e = exp(-vSoft);
+      float a = max((exp(-r2 * vSoft) - e) / (1.0 - e), 0.0);
+      outColor = vec4(vColor * a, 1.0);
+    }
+  `;
+
+  const QUAD_VS = `#version 300 es
+    precision highp float;
+    out vec2 vUv;
+    void main() {
+      vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+      vUv = p;
+      gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    }
+  `;
+
+  // Dual-filter (Kawase) bloom: cheap, wide and stable — ideal on mobile.
+  const DOWN_FS = `#version 300 es
+    precision mediump float;
+    in vec2 vUv;
+    uniform sampler2D uTex;
+    uniform vec2 uTexel;
+    uniform float uPrefilter;
+    out vec4 outColor;
+    vec3 prefilter(vec3 c) {
+      float l = max(c.r, max(c.g, c.b));
+      float knee = 0.3, threshold = 0.32;
+      float soft = clamp(l - threshold + knee, 0.0, 2.0 * knee);
+      soft = soft * soft / (4.0 * knee + 1e-4);
+      return c * max(soft, l - threshold) / max(l, 1e-4);
+    }
+    void main() {
+      vec2 o = uTexel * 0.5;
+      vec3 c = texture(uTex, vUv).rgb * 4.0;
+      c += texture(uTex, vUv + vec2(-o.x, -o.y)).rgb;
+      c += texture(uTex, vUv + vec2( o.x, -o.y)).rgb;
+      c += texture(uTex, vUv + vec2(-o.x,  o.y)).rgb;
+      c += texture(uTex, vUv + vec2( o.x,  o.y)).rgb;
+      c *= 0.125;
+      if (uPrefilter > 0.5) c = prefilter(c);
+      outColor = vec4(c, 1.0);
+    }
+  `;
+
+  const UP_FS = `#version 300 es
+    precision mediump float;
+    in vec2 vUv;
+    uniform sampler2D uTex;
+    uniform vec2 uTexel;
+    uniform float uWeight;
+    out vec4 outColor;
+    void main() {
+      vec2 o = uTexel * 0.5;
+      vec3 c = texture(uTex, vUv + vec2(-o.x * 2.0, 0.0)).rgb;
+      c += texture(uTex, vUv + vec2(-o.x, o.y)).rgb * 2.0;
+      c += texture(uTex, vUv + vec2(0.0, o.y * 2.0)).rgb;
+      c += texture(uTex, vUv + vec2(o.x, o.y)).rgb * 2.0;
+      c += texture(uTex, vUv + vec2(o.x * 2.0, 0.0)).rgb;
+      c += texture(uTex, vUv + vec2(o.x, -o.y)).rgb * 2.0;
+      c += texture(uTex, vUv + vec2(0.0, -o.y * 2.0)).rgb;
+      c += texture(uTex, vUv + vec2(-o.x, -o.y)).rgb * 2.0;
+      outColor = vec4(c * (uWeight / 12.0), 1.0);
+    }
+  `;
+
+  const COMPOSITE_FS = `#version 300 es
+    precision highp float;
+    in vec2 vUv;
+    uniform sampler2D uScene;
+    uniform sampler2D uBloom;
+    uniform vec2 uAspect;
+    uniform vec2 uCenter;
+    uniform float uBeat;
+    uniform float uBloomStrength;
+    uniform float uExposure;
+    uniform float uFade;
+    uniform float uFrame;
+    out vec4 outColor;
+
+    vec3 aces(vec3 x) {
+      return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    }
+    float hash(vec2 p) {
+      p = fract(p * vec2(443.897, 441.423));
+      p += dot(p, p.yx + 19.19);
+      return fract((p.x + p.y) * p.x);
+    }
+    void main() {
+      vec3 scene = texture(uScene, vUv).rgb;
+      vec3 bloom = texture(uBloom, vUv).rgb;
+      vec2 p = (vUv - 0.5) * uAspect;
+      vec2 q = (vUv - uCenter) * uAspect;
+
+      // Deep, warm darkness with a faint crimson breath behind the heart.
+      float d2 = dot(q, q);
+      vec3 bg = vec3(0.0016, 0.0003, 0.0006)
+              + vec3(0.010, 0.0006, 0.0016) * exp(-d2 * 3.0) * (0.8 + 0.4 * uBeat)
+              + vec3(0.003, 0.0002, 0.0007) * exp(-d2 * 0.8);
+
+      vec3 c = bg + (scene + bloom * uBloomStrength * (1.0 + 0.35 * uBeat)) * uExposure;
+      c *= mix(1.0, 0.35, smoothstep(0.35, 1.25, length(p)));
+      c = aces(c * uFade);
+      c = pow(c, vec3(1.0 / 2.2));
+      // Triangular dither removes banding in the dark gradients.
+      float n = hash(gl_FragCoord.xy + fract(uFrame * 0.618) * 97.0)
+              + hash(gl_FragCoord.yx * 1.37 + 11.0) - 1.0;
+      c += n / 255.0;
+      outColor = vec4(c, 1.0);
+    }
+  `;
+
+  /* ------------------------------------------------------------------ *
+   * GL resources                                                       *
+   * ------------------------------------------------------------------ */
+
+  const coarse = matchMedia('(pointer: coarse)').matches;
+  const small = Math.min(screen.width, screen.height) < 600;
+  const mobile = coarse || small;
+  const TOTAL = mobile ? 42000 : 90000;
+  const particles = buildParticles(TOTAL);
+
+  let programs, vao, quadVao, particleBuffer, maxPointSize = 64;
+  let hdr = { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, float: false };
+  let scene = null, mips = [];
+  let lost = false;
+
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS) && !gl.isContextLost()) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function program(vs, fs) {
+    const p = gl.createProgram();
+    const v = compile(gl.VERTEX_SHADER, vs), f = compile(gl.FRAGMENT_SHADER, fs);
+    gl.attachShader(p, v); gl.attachShader(p, f);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS) && !gl.isContextLost()) {
+      throw new Error(gl.getProgramInfoLog(p) || 'program link failed');
+    }
+    gl.deleteShader(v); gl.deleteShader(f);
+    const uniforms = {};
+    const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS) || 0;
+    for (let i = 0; i < count; i++) {
+      const info = gl.getActiveUniform(p, i);
+      uniforms[info.name] = gl.getUniformLocation(p, info.name);
+    }
+    return { p, u: uniforms };
+  }
+
+  function initGL() {
+    if (gl.getExtension('EXT_color_buffer_float')) {
+      hdr = { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, float: true };
+    } else if (gl.getExtension('EXT_color_buffer_half_float')) {
+      hdr = { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, float: true };
+    }
+    gl.getExtension('EXT_float_blend');
+
+    programs = {
+      particles: program(PARTICLE_VS, PARTICLE_FS),
+      down: program(QUAD_VS, DOWN_FS),
+      up: program(QUAD_VS, UP_FS),
+      composite: program(QUAD_VS, COMPOSITE_FS)
+    };
+
+    vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    particleBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, particleBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, particles, gl.STATIC_DRAW);
+    const bytes = STRIDE * 4;
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, bytes, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, bytes, 12);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, bytes, 24);
+    gl.bindVertexArray(null);
+    quadVao = gl.createVertexArray();
+
+    maxPointSize = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1] || 64;
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    scene = null; mips = [];
+    targetsDirty = true;
+  }
+
+  function makeTarget(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, hdr.internal, w, h, 0, hdr.format, hdr.type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { tex, fbo, w, h, ok };
+  }
+
+  function freeTarget(t) {
+    if (!t) return;
+    gl.deleteTexture(t.tex);
+    gl.deleteFramebuffer(t.fbo);
+  }
+
+  function buildTargets() {
+    freeTarget(scene);
+    mips.forEach(freeTarget);
+    mips = [];
+    scene = makeTarget(canvas.width, canvas.height);
+    if (!scene.ok && hdr.float) {
+      // Half-float not renderable after all: fall back to 8-bit.
+      freeTarget(scene);
+      hdr = { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, float: false };
+      scene = makeTarget(canvas.width, canvas.height);
+    }
+    let w = canvas.width, h = canvas.height;
+    for (let i = 0; i < 7; i++) {
+      w = Math.max(1, w >> 1); h = Math.max(1, h >> 1);
+      mips.push(makeTarget(w, h));
+      if (Math.min(w, h) <= 12) break;
+    }
+    targetsDirty = false;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Camera, sizing and interaction                                     *
+   * ------------------------------------------------------------------ */
+
+  const FOV = 34 * Math.PI / 180;
+  let width = 1, height = 1, dpr = 1, renderScale = mobile ? 0.9 : 1;
+  let drawCount = TOTAL;
+  let targetsDirty = true, sizeDirty = true;
+  let camDist = 6, focal = 1;
+  const viewProj = new Float32Array(16);
+  const model = new Float32Array(9);
+  const camera = [0, 0, 6];
+
+  function resize() {
+    width = Math.max(1, innerWidth);
+    height = Math.max(1, innerHeight);
+    dpr = Math.min(window.devicePixelRatio || 1, 2) * renderScale;
+    const w = Math.max(1, Math.round(width * dpr));
+    const h = Math.max(1, Math.round(height * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+      targetsDirty = true;
+    }
+    const aspect = width / height;
+    const tanHalf = Math.tan(FOV / 2);
+    // Frame the heart (≈1.2 half-height, 1.2 half-width) with breathing room.
+    const fillH = 0.64, fillW = 0.8;
+    camDist = Math.max(1.2 / (tanHalf * fillH), 1.2 / (tanHalf * aspect * fillW)) + 0.7;
+    focal = 0.5 * canvas.height / tanHalf;
+    camera[2] = camDist;
+
+    const f = 1 / tanHalf, near = 0.1, far = 60;
+    const nf = 1 / (near - far);
+    const proj = [f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0];
+    // view = translate(0, 0, -camDist)
+    for (let i = 0; i < 16; i++) viewProj[i] = proj[i];
+    for (let r = 0; r < 4; r++) viewProj[12 + r] = proj[8 + r] * -camDist + proj[12 + r];
+    sizeDirty = false;
+  }
+
+  const pointer = { x: 0, y: 0, inside: false, down: false, id: -1, lastX: 0, lastY: 0, lastT: 0, moved: 0, presence: 0 };
+  const orbit = { yaw: 0, pitch: 0, vyaw: 0, vpitch: 0, hoverYaw: 0, hoverPitch: 0 };
+  const ray = [0, 0, -1];
+  const ripple = { dir: [0, 0, -1], age: 9 };
+
+  function pointerRay(clientX, clientY, out) {
+    const nx = (clientX / width) * 2 - 1, ny = 1 - (clientY / height) * 2;
+    const tanHalf = Math.tan(FOV / 2);
+    const x = nx * tanHalf * (width / height), y = ny * tanHalf, z = -1;
+    const l = Math.hypot(x, y, z);
+    out[0] = x / l; out[1] = y / l; out[2] = z / l;
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    pointer.down = true; pointer.id = e.pointerId;
+    pointer.x = pointer.lastX = e.clientX; pointer.y = pointer.lastY = e.clientY;
+    pointer.inside = true; pointer.moved = 0; pointer.lastT = e.timeStamp;
+    orbit.vyaw = orbit.vpitch = 0;
+    try { canvas.setPointerCapture(e.pointerId); } catch { /* not supported */ }
+  });
+  canvas.addEventListener('pointermove', e => {
+    pointer.x = e.clientX; pointer.y = e.clientY; pointer.inside = true;
+    if (pointer.down && e.pointerId === pointer.id) {
+      const dx = e.clientX - pointer.lastX, dy = e.clientY - pointer.lastY;
+      pointer.moved += Math.abs(dx) + Math.abs(dy);
+      const k = 3.2 / Math.min(width, height);
+      orbit.yaw += dx * k; orbit.pitch += dy * k * 0.6;
+      // Fling velocity from real event timing (smoothed), not frame count.
+      const ms = Math.max(8, Math.min(100, e.timeStamp - pointer.lastT));
+      orbit.vyaw = orbit.vyaw * 0.4 + (dx * k * 1000 / ms) * 0.6;
+      orbit.vpitch = orbit.vpitch * 0.4 + (dy * k * 600 / ms) * 0.6;
+      pointer.lastX = e.clientX; pointer.lastY = e.clientY; pointer.lastT = e.timeStamp;
+    }
+  }, { passive: true });
+  const release = e => {
+    if (e.pointerId !== pointer.id) return;
+    pointer.down = false; pointer.id = -1;
+    if (e.pointerType !== 'mouse') pointer.inside = false;
+    if (e.type === 'pointerup' && pointer.moved < 10) tap(e.clientX, e.clientY);
+  };
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', release);
+  canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') pointer.inside = false; });
+  window.addEventListener('blur', () => { pointer.inside = false; pointer.down = false; });
+
+  function tap(x, y) {
+    audio.enable();
+    if (reduced()) return;
+    pointerRay(x, y, ripple.dir);
+    ripple.age = 0;
+  }
+
+  window.addEventListener('keydown', e => {
+    if (e.repeat || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.code === 'KeyM') audio.toggleMuted();
+    else if (e.code === 'Space' || e.code === 'Enter') {
+      e.preventDefault();
+      audio.enable();
+    }
+  });
+
+  /* ------------------------------------------------------------------ *
+   * Frame loop                                                         *
+   * ------------------------------------------------------------------ */
+
+  const reduced = () => motionQuery.matches;
+  let time = 0, intro = 0, last = 0, raf = 0, frameIndex = 0;
+  let slowTime = 0, budgetSteps = 0;
+
+  function damp(current, target, rate, dt) {
+    return target + (current - target) * Math.exp(-rate * dt);
+  }
+
+  function update(dt) {
+    time += dt;
+    intro = Math.min(1, intro + dt / 3.4);
+    rhythm.update(time);
+    audio.schedule(rhythm, time);
+
+    // Drag inertia, then a slow return to the cinematic resting pose.
+    if (!pointer.down) {
+      orbit.yaw += orbit.vyaw * dt; orbit.pitch += orbit.vpitch * dt;
+      orbit.vyaw = damp(orbit.vyaw, 0, 3.5, dt); orbit.vpitch = damp(orbit.vpitch, 0, 3.5, dt);
+      orbit.yaw = damp(orbit.yaw, 0, 0.45, dt); orbit.pitch = damp(orbit.pitch, 0, 0.9, dt);
+    }
+    orbit.pitch = Math.max(-0.7, Math.min(0.7, orbit.pitch));
+    const hover = pointer.inside && !pointer.down && !coarse;
+    orbit.hoverYaw = damp(orbit.hoverYaw, hover ? (pointer.x / width - 0.5) * 0.35 : 0, 2.2, dt);
+    orbit.hoverPitch = damp(orbit.hoverPitch, hover ? (pointer.y / height - 0.5) * 0.22 : 0, 2.2, dt);
+    pointer.presence = damp(pointer.presence, pointer.inside ? 1 : 0, 4, dt);
+    if (pointer.presence > 0.001) pointerRay(pointer.x, pointer.y, ray);
+    ripple.age += dt;
+  }
+
+  function setModel(t) {
+    const yaw = Math.sin(t * 0.21) * 0.42 + Math.sin(t * 0.083) * 0.18 + orbit.yaw + orbit.hoverYaw;
+    const pitch = Math.sin(t * 0.17 + 1.1) * 0.07 - 0.05 + orbit.pitch + orbit.hoverPitch;
+    const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    // R = Rx(pitch) * Ry(yaw), column-major.
+    model[0] = cy;        model[1] = sp * sy;  model[2] = -cp * sy;
+    model[3] = 0;         model[4] = cp;       model[5] = sp;
+    model[6] = sy;        model[7] = -sp * cy; model[8] = cp * cy;
+  }
+
+  function quad(prog, target) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
+    gl.viewport(0, 0, target ? target.w : canvas.width, target ? target.h : canvas.height);
+    gl.useProgram(prog.p);
+    gl.bindVertexArray(quadVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  function render() {
+    if (lost) return;
+    if (sizeDirty) resize();
+    if (targetsDirty) buildTargets();
+    const t = reduced() ? 12.0 : time;
+    setModel(t);
+    const beatAges = reduced() ? [10, 10] : [time - rhythm.current, time - rhythm.previous];
+    const globalBeat = beatShape(beatAges[0]) + beatShape(beatAges[1]);
+    const bob = Math.sin(t * 0.37) * 0.025;
+
+    // 1. Particles → HDR scene.
+    const P = programs.particles, u = P.u;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, scene.fbo);
+    gl.viewport(0, 0, scene.w, scene.h);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(P.p);
+    gl.uniformMatrix4fv(u.uViewProj, false, viewProj);
+    gl.uniformMatrix3fv(u.uModel, false, model);
+    gl.uniform3f(u.uOffset, 0, bob, 0);
+    gl.uniform3f(u.uCamera, camera[0], camera[1], camera[2]);
+    gl.uniform1f(u.uTime, t);
+    gl.uniform2f(u.uBeatAge, beatAges[0], beatAges[1]);
+    gl.uniform1f(u.uIntro, reduced() ? 1 : intro);
+    gl.uniform1f(u.uFocal, focal);
+    gl.uniform1f(u.uFocus, camDist);
+    gl.uniform1f(u.uMaxSize, Math.min(maxPointSize, 96));
+    // Fewer particles (mobile, adaptive quality) are drawn slightly larger
+    // and brighter so the image keeps the same density and energy.
+    const ratio = 90000 / drawCount;
+    gl.uniform1f(u.uSize, 0.0105 * Math.pow(ratio, 0.33));
+    gl.uniform1f(u.uGain, (hdr.float ? 1 : 0.55) * Math.pow(ratio, 0.34) * 0.62);
+    gl.uniform4f(u.uRay, ray[0], ray[1], ray[2], reduced() ? 0 : pointer.presence);
+    gl.uniform4f(u.uRipple, ripple.dir[0], ripple.dir[1], ripple.dir[2], ripple.age);
+    gl.bindVertexArray(vao);
+    gl.drawArrays(gl.POINTS, 0, drawCount);
+    gl.disable(gl.BLEND);
+
+    // 2. Bloom: downsample chain, then additive upsample.
+    const D = programs.down;
+    gl.useProgram(D.p);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniform1i(D.u.uTex, 0);
+    let src = scene;
+    for (let i = 0; i < mips.length; i++) {
+      gl.useProgram(D.p);
+      gl.bindTexture(gl.TEXTURE_2D, src.tex);
+      gl.uniform2f(D.u.uTexel, 1 / src.w, 1 / src.h);
+      gl.uniform1f(D.u.uPrefilter, i === 0 ? 1 : 0);
+      quad(D, mips[i]);
+      src = mips[i];
+    }
+    const U = programs.up;
+    gl.useProgram(U.p);
+    gl.uniform1i(U.u.uTex, 0);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    for (let i = mips.length - 1; i > 0; i--) {
+      gl.useProgram(U.p);
+      gl.bindTexture(gl.TEXTURE_2D, mips[i].tex);
+      gl.uniform2f(U.u.uTexel, 1 / mips[i].w, 1 / mips[i].h);
+      gl.uniform1f(U.u.uWeight, i > 2 ? 0.6 : 0.9);
+      quad(U, mips[i - 1]);
+    }
+    gl.disable(gl.BLEND);
+
+    // 3. Composite.
+    const C = programs.composite;
+    gl.useProgram(C.p);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scene.tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, mips[0].tex);
+    gl.uniform1i(C.u.uScene, 0);
+    gl.uniform1i(C.u.uBloom, 1);
+    const aspect = width / height;
+    gl.uniform2f(C.u.uAspect, aspect >= 1 ? aspect : 1, aspect >= 1 ? 1 : 1 / aspect);
+    gl.uniform2f(C.u.uCenter, 0.5, 0.5 + bob * 0.1);
+    gl.uniform1f(C.u.uBeat, reduced() ? 0 : globalBeat);
+    gl.uniform1f(C.u.uBloomStrength, 0.75);
+    gl.uniform1f(C.u.uExposure, 1.15);
+    gl.uniform1f(C.u.uFade, reduced() ? 1 : Math.min(1, intro * 2.5));
+    gl.uniform1f(C.u.uFrame, frameIndex++);
+    quad(C, null);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
+  function adapt(dt) {
+    // Below ~45 fps for a sustained stretch: trade resolution, then
+    // particle count, for smoothness. Never oscillates back up.
+    if (time < 3.5 || budgetSteps >= 6) return;
+    if (dt > 1 / 45) slowTime += dt;
+    else slowTime = Math.max(0, slowTime - dt * 0.5);
+    if (slowTime < 1.5) return;
+    slowTime = 0;
+    budgetSteps++;
+    if (renderScale > 0.62) { renderScale *= 0.85; sizeDirty = true; }
+    else drawCount = Math.max(Math.floor(TOTAL * 0.4), Math.floor(drawCount * 0.8));
   }
 
   function frame(now) {
+    raf = requestAnimationFrame(frame);
+    const dt = last ? Math.min(Math.max((now - last) / 1000, 0), 1 / 15) : 1 / 60;
+    last = now;
+    update(dt);
+    render();
+    adapt(dt);
+  }
+
+  function start() {
+    if (raf || lost || document.hidden || reduced()) return;
+    last = 0;
+    raf = requestAnimationFrame(frame);
+  }
+  function stop() {
+    cancelAnimationFrame(raf);
     raf = 0;
-    if (document.hidden || motionPreference.matches || contextLost) return;
-    if (now - previous < 16) { raf = requestAnimationFrame(frame); return; }
-    time += Math.min((now - previous) / 1000, .05); previous = now;
-    tiltY += ((pointerActive ? (pointerX / width - .5) * .3 : 0) - tiltY) * .04;
-    tiltX += ((pointerActive ? (pointerY / height - .5) * .16 : 0) - tiltX) * .04;
-    draw(); raf = requestAnimationFrame(frame);
   }
-  function resume() {
-    if (!raf && !document.hidden && !motionPreference.matches && !contextLost) { previous = performance.now(); raf = requestAnimationFrame(frame); }
+  function syncActivity() {
+    const active = !document.hidden && !lost && !reduced();
+    audio.setActive(active);
+    if (active) start();
+    else { stop(); if (!lost && !document.hidden) render(); }
   }
-  function resize() {
-    width = Math.max(1, innerWidth); height = Math.max(1, innerHeight); dpr = Math.min(devicePixelRatio || 1, compact ? 1.6 : 2);
-    canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
-    if (gl && !contextLost) gl.viewport(0, 0, canvas.width, canvas.height);
-    draw();
+
+  window.addEventListener('resize', () => { sizeDirty = true; if (!raf) render(); });
+  document.addEventListener('visibilitychange', syncActivity);
+  motionQuery.addEventListener('change', syncActivity);
+  window.addEventListener('pageshow', syncActivity);
+  window.addEventListener('pagehide', e => { if (!e.persisted) audio.dispose(); else audio.setActive(false); });
+  canvas.addEventListener('webglcontextlost', e => {
+    e.preventDefault();
+    lost = true;
+    stop();
+  });
+  canvas.addEventListener('webglcontextrestored', () => {
+    lost = false;
+    initGL();
+    sizeDirty = true;
+    syncActivity();
+  });
+
+  try {
+    initGL();
+  } catch (err) {
+    console.error(err);
+    return startFallback();
   }
-  canvas.addEventListener('click', () => {
-    void heartbeat.enable(time);
-    if (!motionPreference.matches && time - burstAt > 1.5) burstAt = time;
-  });
-  window.addEventListener('keydown', event => {
-    if (event.repeat || event.ctrlKey || event.altKey || event.metaKey) return;
-    if (event.code === 'KeyM') heartbeat.toggleMuted(time);
-    if (event.code === 'Space' || event.code === 'Enter') { event.preventDefault(); void heartbeat.enable(time); }
-  });
-  window.addEventListener('pointermove', event => {
-    pointerX = event.clientX; pointerY = event.clientY; pointerActive = true;
-    if (motionPreference.matches || time - lastPointerSpark < .03) return;
-    lastPointerSpark = time;
-    for (let i = 0; i < 4 && sparks.length < 160; i++) sparks.push({ x: pointerX, y: pointerY, vx: random(-28, 28), vy: random(-35, 15), born: time, size: random(2, 5), star: Math.random() > .8 });
-  }, { passive: true });
-  document.addEventListener('pointerleave', () => { pointerActive = false; });
-  window.addEventListener('pointerup', event => { if (event.pointerType === 'touch') pointerActive = false; });
-  window.addEventListener('blur', () => { pointerActive = false; });
-  window.addEventListener('resize', resize);
-  document.addEventListener('visibilitychange', () => {
-    heartbeat.setActive(!document.hidden && !motionPreference.matches && !contextLost);
-    if (document.hidden) { cancelAnimationFrame(raf); raf = 0; } else resume();
-  });
-  motionPreference.addEventListener('change', () => {
-    heartbeat.setActive(!document.hidden && !motionPreference.matches && !contextLost);
-    if (motionPreference.matches) { cancelAnimationFrame(raf); raf = 0; draw(); } else resume();
-  });
-  canvas.addEventListener('webglcontextlost', event => { event.preventDefault(); contextLost = true; heartbeat.setActive(false); cancelAnimationFrame(raf); raf = 0; });
-  canvas.addEventListener('webglcontextrestored', () => { initializeGL(); contextLost = false; heartbeat.setActive(!document.hidden && !motionPreference.matches); resize(); resume(); });
-  window.addEventListener('pagehide', event => { if (event.persisted) heartbeat.setActive(false); else heartbeat.dispose(); });
-  window.addEventListener('pageshow', () => heartbeat.setActive(!document.hidden && !motionPreference.matches && !contextLost));
-  heartbeat.setActive(!document.hidden && !motionPreference.matches);
-  resize(); resume();
+  root.classList.add('ready');
+  resize();
+  render();
+  syncActivity();
+
+  // Test / debugging hook: deterministic rendering at a given time.
+  window.__heart = {
+    renderAt(t) { stop(); time = t; intro = Math.min(1, t / 3.4); rhythm.update(t); render(); },
+    get stats() {
+      return { drawCount, renderScale, hdr: hdr.float, total: TOTAL, audio: audio.ctx ? audio.ctx.state : 'off', scheduled: audio.scheduled.size };
+    }
+  };
+
+  /* ------------------------------------------------------------------ *
+   * Fallback (no WebGL2): a CSS heart that keeps the same rhythm.      *
+   * ------------------------------------------------------------------ */
+  function startFallback() {
+    root.classList.add('no-webgl');
+    const heart = document.querySelector('.fallback-heart');
+    if (!heart) return;
+    let t = 0, prev = 0;
+    const loop = now => {
+      const dt = prev ? Math.min((now - prev) / 1000, 0.1) : 0;
+      prev = now;
+      t += dt;
+      rhythm.update(t);
+      audio.schedule(rhythm, t);
+      const b = beatShape(t - rhythm.current) + beatShape(t - rhythm.previous);
+      heart.style.transform = `scale(${1 + 0.07 * b})`;
+      heart.style.filter = `drop-shadow(0 0 ${18 + 22 * b}px rgba(220, 20, 50, ${0.45 + 0.3 * b}))`;
+      if (!motionQuery.matches) requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+    document.addEventListener('pointerup', () => audio.enable());
+  }
 })();
