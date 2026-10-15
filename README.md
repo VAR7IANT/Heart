@@ -35,6 +35,15 @@ It's a static site with no build step and no dependencies, and it works offline.
   followed by a softer dub (S2) about 0.3 s later. Sound is synthesized and
   scheduled ahead on the audio clock, compensated for output latency, so it
   never drifts.
+- **Effects**: these are separate particle layers drawn as one extra batch.
+  Star-shaped glints flare briefly on the skin, mostly near the edge. Three
+  tilted orbits each carry two comets with bright heads and widening tails,
+  which dim as they pass behind the heart. A rim-lit copy of the surface is
+  thrown outward on every lub and dub as a heart-shaped shockwave. Hot sparks
+  rise off the turning heart and cool as they go. A quarter-resolution
+  anamorphic streak turns the brightest highlights into a faint horizontal
+  lens flare. Faded particles are culled in the vertex shader, so they cost no
+  fill rate.
 - **Rotation**: the heart turns about its vertical axis at a constant speed,
   one full revolution every 9 seconds. Its depth is slightly fuller than the
   classic surface, so the profile still reads as a heart when seen side-on.

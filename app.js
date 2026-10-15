@@ -105,9 +105,14 @@
 
   // Per particle: position (3), normal (3), data (4: seed, kind, a, b).
   const STRIDE = 10;
-  const KIND = { surface: 0, interior: 1, aura: 2, ember: 3 };
+  const KIND = { surface: 0, interior: 1, aura: 2, ember: 3, glint: 4, comet: 5, shock: 6, spark: 7 };
 
-  function buildParticles(total) {
+  /**
+   * Builds the base layers (shuffled, so any prefix is a uniform subset for
+   * adaptive quality) followed by the effect layers (sorted by kind, drawn
+   * in full as a second range so each GPU batch runs a single code path).
+   */
+  function buildParticles(total, fx) {
     const rand = mulberry32(0x5eed1e);
     const counts = {
       surface: Math.round(total * 0.6),
@@ -116,7 +121,8 @@
     };
     counts.ember = total - counts.surface - counts.interior - counts.aura;
     const surface = sampleSurface(counts.surface, rand);
-    const data = new Float32Array(total * STRIDE);
+    const fxTotal = fx.glint + fx.comet + fx.shock + fx.spark;
+    const data = new Float32Array((total + fxTotal) * STRIDE);
     let n = 0;
     const push = (x, y, z, nx, ny, nz, kind, a, b) => {
       const o = n++ * STRIDE;
@@ -167,6 +173,40 @@
       data.copyWithin(i * STRIDE, j * STRIDE, j * STRIDE + STRIDE);
       data.set(swap, j * STRIDE);
     }
+
+    const fromSurface = (kind, upperBias) => {
+      let o;
+      do o = Math.floor(rand() * counts.surface) * 6;
+      while (upperBias && surface[o + 1] < -0.2 && rand() < upperBias);
+      push(surface[o], surface[o + 1], surface[o + 2], surface[o + 3], surface[o + 4], surface[o + 5],
+        kind, rand(), rand());
+    };
+
+    // Glints: star-shaped flares that bloom briefly on the skin.
+    for (let i = 0; i < fx.glint; i++) fromSurface(KIND.glint, 0);
+
+    // Comets: 3 tilted orbits × 2 comets, each a bright head with a tail
+    // that widens and fades (head-biased sampling keeps heads dense).
+    // position = (ring, comet phase, tail u); normal = jitter direction.
+    const perComet = Math.floor(fx.comet / 6);
+    for (let ring = 0; ring < 3; ring++) {
+      for (let c = 0; c < 2; c++) {
+        for (let i = 0; i < perComet; i++) {
+          const u = Math.pow(rand(), 1.7);
+          const jx = rand() * 2 - 1, jy = rand() * 2 - 1, jz = rand() * 2 - 1;
+          push(ring, c * 0.5 + ring * 0.17, u, jx, jy, jz, KIND.comet, rand(), rand());
+        }
+      }
+    }
+    for (let i = n; i < total + fx.glint + fx.comet; i++) push(0, 0, 1, 0, 0, 0, KIND.comet, 0, 0);
+
+    // Shockwave: a copy of the skin thrown outward on each lub and dub
+    // (the shader lights only its rim, so it reads as an expanding outline).
+    for (let i = 0; i < fx.shock; i++) fromSurface(KIND.shock, 0);
+
+    // Sparks: bright embers flung upward off the turning heart.
+    for (let i = 0; i < fx.spark; i++) fromSurface(KIND.spark, 0.7);
+
     return data;
   }
 
@@ -206,6 +246,7 @@
 
     out vec3 vColor;
     out float vSoft;
+    out float vStar;
 
     ${COMMON}
     float beat(float delay) { return beatAt(uBeatAge.x - delay) + beatAt(uBeatAge.y - delay); }
@@ -233,8 +274,115 @@
       return fract(sin(vec3(s * 127.1, s * 311.7, s * 74.7)) * 43758.5453) * 2.0 - 1.0;
     }
 
+    mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+    // The heartbeat deformation shared by everything attached to the heart:
+    // swell, a slight settle and a gentle wringing twist.
+    vec3 deform(vec3 p, float b) {
+      p *= 1.0 + 0.068 * b + 0.006 * sin(uTime * 0.55);
+      p.y -= 0.012 * b;
+      p.xz = rot(0.05 * b * p.y) * p.xz;
+      return p;
+    }
+
+    // Projection, point size, depth of field and culling for every particle.
+    void emit(vec3 world, vec3 col, float size, float sharp, float star) {
+      gl_Position = uViewProj * vec4(world, 1.0);
+      float w = max(gl_Position.w, 0.05);
+      float px = size * uSize * uFocal / w;
+      float coc = star > 0.5 ? 0.0 : abs(w - uFocus) * uFocal * 0.0024;
+      float blurred = sqrt(px * px + coc * coc);
+      float energyScale = (px * px) / (blurred * blurred);
+      px = blurred;
+      // Sub-pixel points are widened instead of shrunk: no shimmer.
+      float minPx = 1.4;
+      if (px < minPx) { energyScale *= (px * px) / (minPx * minPx); px = minPx; }
+      if (px > uMaxSize) { energyScale *= (px * px) / (uMaxSize * uMaxSize); px = uMaxSize; }
+      vColor = col * energyScale * uGain;
+      vSoft = mix(sharp, 2.2, clamp(coc / (coc + px * 0.5 + 1.0), 0.0, 1.0));
+      vStar = star;
+      gl_PointSize = px;
+      // Fully faded particles are moved outside the clip volume so they
+      // cost no fill rate at all.
+      if (max(vColor.r, max(vColor.g, vColor.b)) < 1e-4) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+      }
+    }
+
+    // Effect layers: glints, comets, beat shockwave and rising sparks.
+    void effect(float seed, float kind, float ra, float rb) {
+      float t = uTime;
+      float fade = smoothstep(0.55, 1.0, uIntro);
+      float b = beat(0.04);
+      vec3 V;
+      if (kind < 4.5) {
+        // Glint: a lens-like star that blooms on the skin and fades again.
+        float life = 3.0 + 4.0 * ra;
+        float age = fract(t / life + seed);
+        float env = pow(sin(3.14159 * age), 28.0);
+        vec3 world = uModel * (deform(aPos, b) + aNormal * 0.012) + uOffset;
+        vec3 N = normalize(uModel * aNormal);
+        V = normalize(uCamera - world);
+        float ndv = dot(N, V);
+        float e = env * smoothstep(0.0, 0.35, ndv) * (0.35 + 1.65 * (1.0 - abs(ndv)))
+                * (1.0 + 1.0 * b) * fade;
+        vec3 col = mix(vec3(1.0, 0.06, 0.09), vec3(1.0, 0.36, 0.34), env) * e * 0.4;
+        emit(world, col, (13.0 + 12.0 * rb) * (0.55 + 0.45 * env), 4.0, 1.0);
+      } else if (kind < 5.5) {
+        // Comet: a bright head and widening tail on a tilted orbit.
+        float ring = aPos.x, u = aPos.z;
+        float dir = ring == 1.0 ? -1.0 : 1.0;
+        float radius = 1.5 + 0.17 * ring + 0.035 * b;
+        float head = aPos.y * 6.2831853 + t * dir * (0.6 - 0.09 * ring);
+        float theta = head - dir * u * 2.3;
+        vec3 q = vec3(cos(theta), 0.0, sin(theta)) * radius;
+        q.xy = rot((ring - 1.0) * 0.62 + 0.1) * q.xy;
+        q.yz = rot(0.3 + 0.1 * ring) * q.yz;
+        q += aNormal * (0.01 + 0.085 * u * u) + flow(q, t * 0.3) * 0.04 * u;
+        vec3 world = q + uOffset;
+        // Dimmed while it passes behind the heart.
+        float behind = smoothstep(0.1, -0.4, world.z)
+                     * smoothstep(1.3, 0.75, length(world.xy * vec2(0.95, 1.0)));
+        float e = (pow(1.0 - u, 2.6) * 0.75 + exp(-u * 70.0) * 1.5)
+                * (1.0 - 0.9 * behind) * (1.0 + 0.6 * b) * fade;
+        vec3 col = mix(vec3(1.0, 0.03, 0.055), vec3(1.0, 0.42, 0.36), exp(-u * 22.0)) * e * 0.5;
+        emit(world, col, (0.9 + 0.7 * ra) * (1.3 - 0.6 * u), 3.6, 0.0);
+      } else if (kind < 6.5) {
+        // Shockwave: the heart's own silhouette thrown outward on each
+        // lub (and, softer, each dub); only the rim of the shell is lit.
+        float dub = step(rb, 0.33);
+        float age = uBeatAge.x - dub * 0.30;
+        float life = mix(0.88, 0.6, dub);
+        float k = clamp(age / life, 0.0, 1.0);
+        float grow = 1.0 - pow(1.0 - k, 3.0);
+        vec3 q = aPos * (1.05 + mix(0.6, 0.36, dub) * grow) + aNormal * 0.02
+               + hash3(seed) * (0.006 + 0.05 * k);
+        vec3 world = uModel * q + uOffset;
+        V = normalize(uCamera - world);
+        float rim = pow(1.0 - abs(dot(normalize(uModel * aNormal), V)), 3.0);
+        float e = step(0.0, age) * step(age, life) * smoothstep(0.0, 0.06, age)
+                * pow(1.0 - k, 2.0) * mix(1.0, 0.55, dub) * rim * fade * 1.5;
+        vec3 col = mix(vec3(1.0, 0.28, 0.22), vec3(1.0, 0.025, 0.05), k) * e;
+        emit(world, col, (0.9 + 0.6 * ra) * (1.0 + 0.8 * k), 3.5, 0.0);
+      } else {
+        // Spark: a hot ember flung off the turning heart, rising and cooling.
+        float life = 2.6 + 2.8 * ra;
+        float age = fract(t / life + seed);
+        vec3 world = uModel * (deform(aPos, b) + aNormal * (0.04 + 0.28 * age)) + uOffset;
+        world.y += age * age * (0.8 + 0.8 * rb);
+        world += flow(world * 0.7, t * 0.4) * 0.1 * age;
+        float tw = 0.75 + 0.25 * sin(t * 2.1 + seed * 50.0);
+        float e = smoothstep(0.0, 0.08, age) * pow(1.0 - age, 1.6) * tw * fade * 1.4;
+        vec3 col = mix(vec3(1.0, 0.3, 0.2), vec3(1.0, 0.035, 0.06), age) * e;
+        emit(world, col, 0.75 + 0.55 * rb, 4.5, 0.0);
+      }
+    }
+
+
     void main() {
       float seed = aData.x, kind = aData.y, ra = aData.z, rb = aData.w;
+      if (kind > 3.5) { effect(seed, kind, ra, rb); return; }
       vec3 p = aPos, n = aNormal;
       float alpha = 1.0, size = 1.0, sharp = 4.0;
       float t = uTime;
@@ -289,12 +437,8 @@
 
       // Lub-dub: a pressure wave from the core outward (core moves first).
       float b = beat(coreDist * 0.06 + (kind > 1.5 && kind < 2.5 ? wave * 0.25 : 0.0));
-      float scale = 1.0 + 0.068 * b + 0.006 * sin(t * 0.55);
       if (kind < 2.5) {
-        p *= scale;
-        p.y -= 0.012 * b;
-        float twist = 0.05 * b * p.y;
-        p.xz = mat2(cos(twist), -sin(twist), sin(twist), cos(twist)) * p.xz;
+        p = deform(p, b);
         if (kind > 1.5) p += n * b * 0.07 * (1.0 - wave);
       }
 
@@ -358,24 +502,7 @@
       } else {
         col = vec3(0.7, 0.05, 0.07) * 0.16;
       }
-      col *= 1.0 + glow;
-
-      gl_Position = uViewProj * vec4(world, 1.0);
-      float w = max(gl_Position.w, 0.05);
-
-      // Size in pixels, with depth-of-field blur and energy conservation.
-      float px = size * uSize * uFocal / w;
-      float coc = abs(w - uFocus) * uFocal * 0.0024;
-      float blurred = sqrt(px * px + coc * coc);
-      float energyScale = (px * px) / (blurred * blurred);
-      px = blurred;
-      // Sub-pixel points are widened instead of shrunk: no shimmer.
-      float minPx = 1.4;
-      if (px < minPx) { energyScale *= (px * px) / (minPx * minPx); px = minPx; }
-      if (px > uMaxSize) { energyScale *= (px * px) / (uMaxSize * uMaxSize); px = uMaxSize; }
-      gl_PointSize = px;
-      vColor = col * alpha * energyScale * uGain;
-      vSoft = mix(sharp, 2.2, clamp(coc / (coc + px * 0.5 + 1.0), 0.0, 1.0));
+      emit(world, col * alpha * (1.0 + glow), size, sharp, 0.0);
     }
   `;
 
@@ -383,12 +510,22 @@
     precision mediump float;
     in vec3 vColor;
     in float vSoft;
+    in float vStar;
     out vec4 outColor;
     void main() {
       vec2 c = gl_PointCoord * 2.0 - 1.0;
       float r2 = dot(c, c);
       float e = exp(-vSoft);
       float a = max((exp(-r2 * vSoft) - e) / (1.0 - e), 0.0);
+      if (vStar > 0.5) {
+        // Four-point star with fainter diagonals, tapering to the edge.
+        vec2 ac = abs(c);
+        vec2 d = abs(vec2(c.x + c.y, c.x - c.y)) * 0.7071;
+        float rays = exp(-ac.y * 16.0) * (1.0 - ac.x) + exp(-ac.x * 16.0) * (1.0 - ac.y);
+        rays += 0.35 * (exp(-d.y * 22.0) * max(1.0 - d.x * 1.7, 0.0)
+                      + exp(-d.x * 22.0) * max(1.0 - d.y * 1.7, 0.0));
+        a = exp(-r2 * 26.0) * 1.6 + exp(-r2 * 6.0) * 0.25 + rays * 0.5 * max(1.0 - r2, 0.0);
+      }
       outColor = vec4(vColor * a, 1.0);
     }
   `;
@@ -452,11 +589,31 @@
     }
   `;
 
+  // Anamorphic streak at quarter resolution: only the brightest highlights
+  // (glints, comet heads, the hottest rim) smear into a horizontal flare.
+  const STREAK_FS = `#version 300 es
+    precision mediump float;
+    in vec2 vUv;
+    uniform sampler2D uTex;
+    uniform float uStep;
+    out vec4 outColor;
+    void main() {
+      vec3 c = vec3(0.0);
+      for (int i = -10; i <= 10; i++) {
+        float fi = float(i);
+        vec3 s = texture(uTex, vUv + vec2(fi * uStep, 0.0)).rgb;
+        c += max(s - 0.05, 0.0) * exp(-abs(fi) * 0.24);
+      }
+      outColor = vec4(c, 1.0);
+    }
+  `;
+
   const COMPOSITE_FS = `#version 300 es
     precision highp float;
     in vec2 vUv;
     uniform sampler2D uScene;
     uniform sampler2D uBloom;
+    uniform sampler2D uStreak;
     uniform vec2 uAspect;
     uniform vec2 uCenter;
     uniform float uBeat;
@@ -477,6 +634,7 @@
     void main() {
       vec3 scene = texture(uScene, vUv).rgb;
       vec3 bloom = texture(uBloom, vUv).rgb;
+      bloom += texture(uStreak, vUv).rgb * vec3(1.0, 0.5, 0.55) * 0.09;
       vec2 p = (vUv - 0.5) * uAspect;
       vec2 q = (vUv - uCenter) * uAspect;
 
@@ -506,11 +664,15 @@
   const small = Math.min(screen.width, screen.height) < 600;
   const mobile = coarse || small;
   const TOTAL = mobile ? 42000 : 90000;
-  const particles = buildParticles(TOTAL);
+  const FX = mobile
+    ? { glint: 160, comet: 2520, shock: 3600, spark: 1100 }
+    : { glint: 260, comet: 4800, shock: 6000, spark: 2000 };
+  const FX_TOTAL = FX.glint + FX.comet + FX.shock + FX.spark;
+  const particles = buildParticles(TOTAL, FX);
 
   let programs, vao, quadVao, particleBuffer, maxPointSize = 64;
   let hdr = { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, float: false };
-  let scene = null, mips = [];
+  let scene = null, mips = [], streak = null;
   let lost = false;
 
   function compile(type, source) {
@@ -553,6 +715,7 @@
       particles: program(PARTICLE_VS, PARTICLE_FS),
       down: program(QUAD_VS, DOWN_FS),
       up: program(QUAD_VS, UP_FS),
+      streak: program(QUAD_VS, STREAK_FS),
       composite: program(QUAD_VS, COMPOSITE_FS)
     };
 
@@ -571,7 +734,7 @@
     maxPointSize = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1] || 64;
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.CULL_FACE);
-    scene = null; mips = [];
+    scene = null; mips = []; streak = null;
     targetsDirty = true;
   }
 
@@ -599,6 +762,7 @@
 
   function buildTargets() {
     freeTarget(scene);
+    freeTarget(streak);
     mips.forEach(freeTarget);
     mips = [];
     scene = makeTarget(canvas.width, canvas.height);
@@ -614,6 +778,8 @@
       mips.push(makeTarget(w, h));
       if (Math.min(w, h) <= 12) break;
     }
+    const src = mips[Math.min(1, mips.length - 1)];
+    streak = makeTarget(src.w, src.h);
     targetsDirty = false;
   }
 
@@ -812,6 +978,10 @@
     gl.uniform4f(u.uRipple, ripple.dir[0], ripple.dir[1], ripple.dir[2], ripple.age);
     gl.bindVertexArray(vao);
     gl.drawArrays(gl.POINTS, 0, drawCount);
+    // Effect layers: fixed counts, drawn at their designed size and energy.
+    gl.uniform1f(u.uSize, 0.0105);
+    gl.uniform1f(u.uGain, (hdr.float ? 1 : 0.55) * 0.62);
+    gl.drawArrays(gl.POINTS, TOTAL, FX_TOTAL);
     gl.disable(gl.BLEND);
 
     // 2. Bloom: downsample chain, then additive upsample.
@@ -842,6 +1012,16 @@
     }
     gl.disable(gl.BLEND);
 
+    // Streak from the quarter-resolution bloom level.
+    const S = programs.streak;
+    const streakSrc = mips[Math.min(1, mips.length - 1)];
+    gl.useProgram(S.p);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, streakSrc.tex);
+    gl.uniform1i(S.u.uTex, 0);
+    gl.uniform1f(S.u.uStep, 1.8 / streakSrc.w);
+    quad(S, streak);
+
     // 3. Composite.
     const C = programs.composite;
     gl.useProgram(C.p);
@@ -849,6 +1029,8 @@
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, mips[0].tex);
     gl.uniform1i(C.u.uScene, 0);
     gl.uniform1i(C.u.uBloom, 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, streak.tex);
+    gl.uniform1i(C.u.uStreak, 2);
     const aspect = width / height;
     gl.uniform2f(C.u.uAspect, aspect >= 1 ? aspect : 1, aspect >= 1 ? 1 : 1 / aspect);
     gl.uniform2f(C.u.uCenter, 0.5, 0.5 + bob * 0.1);
