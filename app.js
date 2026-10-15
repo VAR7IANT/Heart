@@ -44,7 +44,7 @@
   // whose gradient — unlike the classic sextic's — never vanishes along the
   // heart's equator. That degeneracy is what produces the bright horizontal
   // "seam" in naive renderings; with F, distances and normals are smooth.
-  const DEPTH = 1.1;   // slightly fuller than the classic surface
+  const DEPTH = 1.3;   // fuller than the classic surface: rounder in profile
   const LIFT = 0.118;  // centers the shape vertically
 
   function field(X, Y, Z, out) {
@@ -66,7 +66,7 @@
     };
   }
 
-  const BOX = [1.2, 1.18, 0.78];
+  const BOX = [1.2, 1.18, 0.92];
 
   /** Uniform points on the surface: uniform samples in a thin band are kept
    *  only if their true distance to the surface (measured after Newton
@@ -307,7 +307,9 @@
         alpha *= k;
       }
 
-      vec3 world = uModel * p + uOffset;
+      // Embers stay fixed in the world so the backdrop is calm while the
+      // heart turns; everything else rotates with the heart.
+      vec3 world = (kind > 2.5 ? p : uModel * p) + uOffset;
 
       // Pointer: particles near the pointer ray part gently, and a tap sends
       // a soft ring outward around it.
@@ -656,7 +658,8 @@
   }
 
   const pointer = { x: 0, y: 0, inside: false, down: false, id: -1, lastX: 0, lastY: 0, lastT: 0, moved: 0, presence: 0 };
-  const orbit = { yaw: 0, pitch: 0, vyaw: 0, vpitch: 0, hoverYaw: 0, hoverPitch: 0 };
+  const orbit = { yaw: 0, pitch: 0, vyaw: 0, vpitch: 0, hoverPitch: 0 };
+  const REVOLUTION = 9; // seconds per full turn
   const ray = [0, 0, -1];
   const ripple = { dir: [0, 0, -1], age: 9 };
 
@@ -734,15 +737,16 @@
     rhythm.update(time);
     audio.schedule(rhythm, time);
 
-    // Drag inertia, then a slow return to the cinematic resting pose.
+    // Drag inertia. A drag shifts the phase of the turntable rotation (it
+    // is kept, so the spin simply carries on from there); tilt eases back.
     if (!pointer.down) {
       orbit.yaw += orbit.vyaw * dt; orbit.pitch += orbit.vpitch * dt;
       orbit.vyaw = damp(orbit.vyaw, 0, 3.5, dt); orbit.vpitch = damp(orbit.vpitch, 0, 3.5, dt);
-      orbit.yaw = damp(orbit.yaw, 0, 0.45, dt); orbit.pitch = damp(orbit.pitch, 0, 0.9, dt);
+      orbit.pitch = damp(orbit.pitch, 0, 0.9, dt);
     }
+    orbit.yaw %= Math.PI * 2;
     orbit.pitch = Math.max(-0.7, Math.min(0.7, orbit.pitch));
     const hover = pointer.inside && !pointer.down && !coarse;
-    orbit.hoverYaw = damp(orbit.hoverYaw, hover ? (pointer.x / width - 0.5) * 0.35 : 0, 2.2, dt);
     orbit.hoverPitch = damp(orbit.hoverPitch, hover ? (pointer.y / height - 0.5) * 0.22 : 0, 2.2, dt);
     pointer.presence = damp(pointer.presence, pointer.inside ? 1 : 0, 4, dt);
     if (pointer.presence > 0.001) pointerRay(pointer.x, pointer.y, ray);
@@ -750,8 +754,11 @@
   }
 
   function setModel(t) {
-    const yaw = Math.sin(t * 0.21) * 0.42 + Math.sin(t * 0.083) * 0.18 + orbit.yaw + orbit.hoverYaw;
-    const pitch = Math.sin(t * 0.17 + 1.1) * 0.07 - 0.05 + orbit.pitch + orbit.hoverPitch;
+    // Turntable: one full revolution about the vertical axis every
+    // REVOLUTION seconds at a perfectly constant angular speed. Hover only
+    // tilts (pitch), so it never speeds up or slows down the spin.
+    const yaw = ((t % REVOLUTION) / REVOLUTION) * Math.PI * 2 + orbit.yaw;
+    const pitch = -0.08 + orbit.pitch + orbit.hoverPitch;
     const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
     // R = Rx(pitch) * Ry(yaw), column-major.
     model[0] = cy;        model[1] = sp * sy;  model[2] = -cp * sy;
@@ -772,7 +779,7 @@
     if (sizeDirty) resize();
     if (targetsDirty) buildTargets();
     const t = reduced() ? 12.0 : time;
-    setModel(t);
+    setModel(reduced() ? 0 : time); // still frame faces the viewer
     const beatAges = reduced() ? [10, 10] : [time - rhythm.current, time - rhythm.previous];
     const globalBeat = beatShape(beatAges[0]) + beatShape(beatAges[1]);
     const bob = Math.sin(t * 0.37) * 0.025;

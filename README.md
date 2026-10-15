@@ -35,6 +35,11 @@ It's a static site with no build step and no dependencies, and it works offline.
   followed by a softer dub (S2) about 0.3 s later. Sound is synthesized and
   scheduled ahead on the audio clock, compensated for output latency, so it
   never drifts.
+- **Rotation**: the heart turns about its vertical axis at a constant speed,
+  one full revolution every 9 seconds. Its depth is slightly fuller than the
+  classic surface, so the profile still reads as a heart when seen side-on.
+  Background embers stay fixed in the world, so the scene stays calm while
+  the heart spins.
 - **Smoothness**: there is no per-frame CPU work proportional to the particle
   count and no frame skipping. If the frame rate stays below about 45 fps, the
   renderer first lowers its resolution and then the particle count, and the
@@ -44,9 +49,10 @@ It's a static site with no build step and no dependencies, and it works offline.
 
 - Tap or click to start the heartbeat sound and send a ripple through the
   particles.
-- Drag to rotate the heart. It eases back to its resting pose.
-- On desktop, hovering tilts the heart slightly and particles part around the
-  cursor.
+- Drag to spin the heart forward or back. The constant rotation carries on
+  from wherever you leave it, and any tilt eases back.
+- On desktop, hovering tilts the heart slightly (without changing its spin
+  speed) and particles part around the cursor.
 - `Space` or `Enter` starts the sound, and `M` mutes it.
 - Rendering pauses in background tabs. With `prefers-reduced-motion`, a still
   frame is shown. Browsers without WebGL2 get a CSS heart that beats in the
