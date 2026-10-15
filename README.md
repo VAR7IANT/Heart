@@ -44,11 +44,17 @@ It's a static site with no build step and no dependencies, and it works offline.
   anamorphic streak turns the brightest highlights into a faint horizontal
   lens flare. Faded particles are culled in the vertex shader, so they cost no
   fill rate.
+- **Atmosphere**: a wide two-armed spiral disc of light turns slowly around
+  the heart, tilted so it sweeps beneath it, and each beat sends a ring of
+  light across it. Soft light rays stream outward from the heart (a jittered,
+  quarter-resolution radial blur). Drifting dust and a few out-of-focus
+  heart-shaped bokeh are placed through the live camera frustum, so they fill
+  the whole screen on portrait phones and wide monitors alike.
 - **Rotation**: the heart turns about its vertical axis at a constant speed,
   one full revolution every 9 seconds. Its depth is slightly fuller than the
   classic surface, so the profile still reads as a heart when seen side-on.
-  Background embers stay fixed in the world, so the scene stays calm while
-  the heart spins.
+  The dust, disc and bokeh move independently of the heart, so the space
+  around it stays alive while it spins.
 - **Smoothness**: there is no per-frame CPU work proportional to the particle
   count and no frame skipping. If the frame rate stays below about 45 fps, the
   renderer first lowers its resolution and then the particle count, and the

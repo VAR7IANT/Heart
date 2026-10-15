@@ -105,7 +105,7 @@
 
   // Per particle: position (3), normal (3), data (4: seed, kind, a, b).
   const STRIDE = 10;
-  const KIND = { surface: 0, interior: 1, aura: 2, ember: 3, glint: 4, comet: 5, shock: 6, spark: 7 };
+  const KIND = { surface: 0, interior: 1, aura: 2, ember: 3, glint: 4, comet: 5, shock: 6, spark: 7, disc: 8, bokeh: 9 };
 
   /**
    * Builds the base layers (shuffled, so any prefix is a uniform subset for
@@ -117,11 +117,11 @@
     const counts = {
       surface: Math.round(total * 0.6),
       interior: Math.round(total * 0.15),
-      aura: Math.round(total * 0.24)
+      aura: Math.round(total * 0.205)
     };
     counts.ember = total - counts.surface - counts.interior - counts.aura;
     const surface = sampleSurface(counts.surface, rand);
-    const fxTotal = fx.glint + fx.comet + fx.shock + fx.spark;
+    const fxTotal = fx.glint + fx.comet + fx.shock + fx.spark + fx.disc + fx.bokeh;
     const data = new Float32Array((total + fxTotal) * STRIDE);
     let n = 0;
     const push = (x, y, z, nx, ny, nz, kind, a, b) => {
@@ -157,12 +157,12 @@
         KIND.aura, rand(), rand());
     }
 
-    // Embers: a sparse, deep volume around the heart.
+    // Embers: drifting dust that fills the whole view in depth. Positions
+    // are stored in normalized screen space (x, y in -1..1) plus depth; the
+    // shader maps them through the live camera frustum, so the dust fills
+    // portrait phones and wide monitors alike.
     for (let i = 0; i < counts.ember; i++) {
-      const u = rand() * 2 - 1, phi = rand() * Math.PI * 2, s = Math.sqrt(1 - u * u);
-      const r = 1.7 + Math.pow(rand(), 0.7) * 3.6;
-      push(Math.cos(phi) * s * r * 1.5, u * r * 0.85, Math.sin(phi) * s * r - 1.2,
-        0, 1, 0, KIND.ember, rand(), rand());
+      push(rand() * 2 - 1, rand() * 2 - 1, -7 + rand() * 9.5, 0, 1, 0, KIND.ember, rand(), rand());
     }
 
     // Global shuffle (so reduced draw counts keep every layer's ratio).
@@ -207,6 +207,29 @@
     // Sparks: bright embers flung upward off the turning heart.
     for (let i = 0; i < fx.spark; i++) fromSurface(KIND.spark, 0.7);
 
+    // Disc: a wide, two-armed spiral of light the heart floats inside.
+    // position = (radius, angle, height).
+    for (let i = 0; i < fx.disc; i++) {
+      const r = 1.85 + Math.pow(rand(), 1.25) * 3.1;
+      let theta = rand() * Math.PI * 2;
+      if (rand() < 0.62) {
+        const g = (rand() + rand() + rand() - 1.5) * 0.55;
+        theta = (i & 1) * Math.PI + Math.log(r) * 2.6 + g;
+      }
+      const h = (rand() + rand() - 1) * 0.05 * r;
+      push(r, theta, h, 0, 0, 0, KIND.disc, rand(), rand());
+    }
+
+    // Bokeh: a few soft, out-of-focus hearts drifting up in the distance.
+    // position = (normalized screen x, depth).
+    for (let i = 0; i < fx.bokeh;) {
+      const z = -4.5 + rand() * 6;
+      const x = rand() * 2 - 1;
+      if (z > -2.2 && Math.abs(x) < 0.4) continue;
+      push(x, z, 0, 0, 0, 0, KIND.bokeh, rand(), rand());
+      i++;
+    }
+
     return data;
   }
 
@@ -238,6 +261,8 @@
     uniform float uIntro;
     uniform float uFocal;
     uniform float uFocus;
+    uniform vec2 uFrustum;    // tan(fov/2) * (aspect, 1)
+    uniform float uDiscGain;  // compensates the smaller disc on phones
     uniform float uMaxSize;
     uniform float uSize;
     uniform float uGain;
@@ -290,7 +315,7 @@
       gl_Position = uViewProj * vec4(world, 1.0);
       float w = max(gl_Position.w, 0.05);
       float px = size * uSize * uFocal / w;
-      float coc = star > 0.5 ? 0.0 : abs(w - uFocus) * uFocal * 0.0024;
+      float coc = star > 0.5 && star < 1.5 ? 0.0 : abs(w - uFocus) * uFocal * 0.0024;
       float blurred = sqrt(px * px + coc * coc);
       float energyScale = (px * px) / (blurred * blurred);
       px = blurred;
@@ -365,7 +390,7 @@
                 * pow(1.0 - k, 2.0) * mix(1.0, 0.55, dub) * rim * fade * 1.5;
         vec3 col = mix(vec3(1.0, 0.28, 0.22), vec3(1.0, 0.025, 0.05), k) * e;
         emit(world, col, (0.9 + 0.6 * ra) * (1.0 + 0.8 * k), 3.5, 0.0);
-      } else {
+      } else if (kind < 7.5) {
         // Spark: a hot ember flung off the turning heart, rising and cooling.
         float life = 2.6 + 2.8 * ra;
         float age = fract(t / life + seed);
@@ -376,6 +401,35 @@
         float e = smoothstep(0.0, 0.08, age) * pow(1.0 - age, 1.6) * tw * fade * 1.4;
         vec3 col = mix(vec3(1.0, 0.3, 0.2), vec3(1.0, 0.035, 0.06), age) * e;
         emit(world, col, 0.75 + 0.55 * rb, 4.5, 0.0);
+      } else if (kind < 8.5) {
+        // Disc: rigid spiral pattern turning slowly (arms never smear),
+        // tilted so its near side sweeps beneath the heart; each beat sends
+        // a ring of light outward across it.
+        float r = aPos.x;
+        float theta = aPos.y + t * 0.1 + 0.05 * sin(t * 0.27 + seed * 20.0);
+        vec3 q = vec3(cos(theta) * r, aPos.z, sin(theta) * r);
+        q.yz = rot(-0.38) * q.yz;
+        q.y -= 0.3;
+        q += flow(q * 0.45, t * 0.15) * 0.07;
+        vec3 world = q + uOffset;
+        float behind = smoothstep(0.1, -0.4, world.z)
+                     * smoothstep(1.3, 0.75, length(world.xy * vec2(0.95, 1.0)));
+        float wave = beat(r * 0.13);
+        float shape = smoothstep(1.85, 2.4, r) * (1.0 - smoothstep(3.7, 4.95, r));
+        float e = (0.1 + 0.16 * rb * rb + 0.32 * wave) * (ra > 0.97 ? 3.5 : 1.0) * uDiscGain
+                * shape * (1.0 - 0.85 * behind) * fade;
+        vec3 col = mix(vec3(0.55, 0.015, 0.04), vec3(1.0, 0.07, 0.09), rb * 0.6 + wave * 0.4) * e;
+        emit(world, col, 0.8 + 0.8 * ra, 3.4, 0.0);
+      } else {
+        // Bokeh hearts: slow, swaying, deeply out of focus.
+        float life = 18.0 + 12.0 * ra;
+        float age = fract(t / life + seed);
+        vec2 span = uFrustum * (uFocus - aPos.y);
+        vec3 world = vec3(aPos.x * span.x + sin(t * 0.35 + seed * 30.0) * 0.3,
+                          mix(-1.2, 1.2, age) * span.y, aPos.y);
+        world += uOffset;
+        float e = sin(3.14159 * age) * (0.05 + 0.07 * rb) * (1.0 + 0.4 * b) * fade;
+        emit(world, vec3(1.0, 0.05, 0.08) * e * 0.8, 17.0 + 15.0 * rb, 2.0, 2.0);
       }
     }
 
@@ -429,9 +483,12 @@
         // Embers: distant, slow and softly out of focus.
         float life = 14.0 + 10.0 * ra;
         float age = fract(t / life + seed);
+        p = vec3(aPos.xy * uFrustum * (uFocus - aPos.z) * 1.08, aPos.z);
         p += flow(p * 0.3, t * 0.05) * 0.22 + vec3(0.0, (age - 0.5) * 0.9, 0.0);
-        alpha = sin(3.14159 * age);
-        size = 1.0 + 1.6 * rb;
+        // Keep the space immediately around the heart clear.
+        alpha *= smoothstep(1.5, 2.1, length(vec3(p.xy, p.z * 1.4)));
+        alpha *= sin(3.14159 * age) * (rb > 0.9 ? 3.0 : 1.0);
+        size = 0.9 + 1.4 * rb;
         sharp = 2.6;
       }
 
@@ -447,7 +504,7 @@
       k = k * k * (3.0 - 2.0 * k);
       if (k < 1.0) {
         vec3 far = aPos * (2.4 + 1.8 * ra) + hash3(seed) * 1.4 + flow(aPos, seed * 10.0) * 0.4;
-        p = mix(far, p, k);
+        if (kind < 2.5) p = mix(far, p, k);
         alpha *= k;
       }
 
@@ -500,7 +557,7 @@
         energy = (0.3 + 0.5 * b) * (0.12 + 0.88 * pow(fres, 2.0));
         col = mix(crimson, deep, wave) * energy;
       } else {
-        col = vec3(0.7, 0.05, 0.07) * 0.16;
+        col = vec3(0.8, 0.05, 0.08) * 0.2;
       }
       emit(world, col * alpha * (1.0 + glow), size, sharp, 0.0);
     }
@@ -517,7 +574,17 @@
       float r2 = dot(c, c);
       float e = exp(-vSoft);
       float a = max((exp(-r2 * vSoft) - e) / (1.0 - e), 0.0);
-      if (vStar > 0.5) {
+      if (vStar > 1.5) {
+        // Soft heart bokeh: a smooth heart SDF with a faint brighter rim.
+        vec2 p = vec2(abs(c.x), 0.62 - c.y) * 0.95;
+        float d;
+        if (p.y + p.x > 1.0) d = length(p - vec2(0.25, 0.75)) - 0.35355;
+        else d = sqrt(min(dot(p - vec2(0.0, 1.0), p - vec2(0.0, 1.0)),
+                          dot(p - 0.5 * max(p.x + p.y, 0.0), p - 0.5 * max(p.x + p.y, 0.0))))
+                 * sign(p.x - p.y);
+        float body = smoothstep(0.1, -0.16, d);
+        a = body * (0.7 + 0.45 * smoothstep(-0.25, -0.03, d));
+      } else if (vStar > 0.5) {
         // Four-point star with fainter diagonals, tapering to the edge.
         vec2 ac = abs(c);
         vec2 d = abs(vec2(c.x + c.y, c.x - c.y)) * 0.7071;
@@ -608,12 +675,39 @@
     }
   `;
 
+  // Light rays: a radial blur of the bloom toward the heart's center, so the
+  // glow streams outward into the surrounding darkness in soft shafts.
+  const RAYS_FS = `#version 300 es
+    precision highp float;
+    in vec2 vUv;
+    uniform sampler2D uTex;
+    uniform vec2 uCenter;
+    out vec4 outColor;
+    void main() {
+      vec2 delta = (uCenter - vUv) * (0.6 / 32.0);
+      // Per-pixel jittered start hides the discrete sample steps (which
+      // otherwise show up as beaded copies of bright points).
+      float j = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+      vec2 uv = vUv + delta * j;
+      float w = 1.0;
+      vec3 c = vec3(0.0);
+      for (int i = 0; i < 32; i++) {
+        c += max(texture(uTex, uv).rgb - 0.06, 0.0) * w;
+        uv += delta;
+        w *= 0.95;
+      }
+      outColor = vec4(c / 16.0, 1.0);
+    }
+  `;
+
   const COMPOSITE_FS = `#version 300 es
     precision highp float;
     in vec2 vUv;
     uniform sampler2D uScene;
     uniform sampler2D uBloom;
     uniform sampler2D uStreak;
+    uniform sampler2D uRays;
+    uniform float uRayStrength;
     uniform vec2 uAspect;
     uniform vec2 uCenter;
     uniform float uBeat;
@@ -635,6 +729,7 @@
       vec3 scene = texture(uScene, vUv).rgb;
       vec3 bloom = texture(uBloom, vUv).rgb;
       bloom += texture(uStreak, vUv).rgb * vec3(1.0, 0.5, 0.55) * 0.09;
+      bloom += texture(uRays, vUv).rgb * uRayStrength;
       vec2 p = (vUv - 0.5) * uAspect;
       vec2 q = (vUv - uCenter) * uAspect;
 
@@ -665,15 +760,15 @@
   const mobile = coarse || small;
   const TOTAL = mobile ? 42000 : 90000;
   const FX = mobile
-    ? { glint: 160, comet: 2520, shock: 3600, spark: 1100 }
-    : { glint: 260, comet: 4800, shock: 6000, spark: 2000 };
-  const FX_TOTAL = FX.glint + FX.comet + FX.shock + FX.spark;
+    ? { glint: 160, comet: 2520, shock: 3600, spark: 1100, disc: 9000, bokeh: 26 }
+    : { glint: 260, comet: 4800, shock: 6000, spark: 2000, disc: 18000, bokeh: 40 };
+  const FX_TOTAL = FX.glint + FX.comet + FX.shock + FX.spark + FX.disc + FX.bokeh;
   const particles = buildParticles(TOTAL, FX);
 
   let programs, vao, quadVao, particleBuffer, maxPointSize = 64;
   let hdr = { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, float: false };
-  let scene = null, mips = [], streak = null;
-  let lost = false;
+  let scene = null, mips = [], streak = null, rays = null;
+  let lost = false, failed = false;
 
   function compile(type, source) {
     const shader = gl.createShader(type);
@@ -716,6 +811,7 @@
       down: program(QUAD_VS, DOWN_FS),
       up: program(QUAD_VS, UP_FS),
       streak: program(QUAD_VS, STREAK_FS),
+      rays: program(QUAD_VS, RAYS_FS),
       composite: program(QUAD_VS, COMPOSITE_FS)
     };
 
@@ -734,7 +830,7 @@
     maxPointSize = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1] || 64;
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.CULL_FACE);
-    scene = null; mips = []; streak = null;
+    scene = null; mips = []; streak = null; rays = null;
     targetsDirty = true;
   }
 
@@ -763,6 +859,7 @@
   function buildTargets() {
     freeTarget(scene);
     freeTarget(streak);
+    freeTarget(rays);
     mips.forEach(freeTarget);
     mips = [];
     scene = makeTarget(canvas.width, canvas.height);
@@ -780,6 +877,7 @@
     }
     const src = mips[Math.min(1, mips.length - 1)];
     streak = makeTarget(src.w, src.h);
+    rays = makeTarget(src.w, src.h);
     targetsDirty = false;
   }
 
@@ -941,7 +1039,7 @@
   }
 
   function render() {
-    if (lost) return;
+    if (lost || failed) return;
     if (sizeDirty) resize();
     if (targetsDirty) buildTargets();
     const t = reduced() ? 12.0 : time;
@@ -968,6 +1066,9 @@
     gl.uniform1f(u.uIntro, reduced() ? 1 : intro);
     gl.uniform1f(u.uFocal, focal);
     gl.uniform1f(u.uFocus, camDist);
+    const tanHalf = Math.tan(FOV / 2);
+    gl.uniform2f(u.uFrustum, tanHalf * width / height, tanHalf);
+    gl.uniform1f(u.uDiscGain, mobile ? 1.6 : 1);
     gl.uniform1f(u.uMaxSize, Math.min(maxPointSize, 96));
     // Fewer particles (mobile, adaptive quality) are drawn slightly larger
     // and brighter so the image keeps the same density and energy.
@@ -1022,6 +1123,12 @@
     gl.uniform1f(S.u.uStep, 1.8 / streakSrc.w);
     quad(S, streak);
 
+    const Y = programs.rays;
+    gl.useProgram(Y.p);
+    gl.uniform1i(Y.u.uTex, 0);
+    gl.uniform2f(Y.u.uCenter, 0.5, 0.5 + bob * 0.1);
+    quad(Y, rays);
+
     // 3. Composite.
     const C = programs.composite;
     gl.useProgram(C.p);
@@ -1031,6 +1138,9 @@
     gl.uniform1i(C.u.uBloom, 1);
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, streak.tex);
     gl.uniform1i(C.u.uStreak, 2);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, rays.tex);
+    gl.uniform1i(C.u.uRays, 3);
+    gl.uniform1f(C.u.uRayStrength, 0.16 * (1 + 0.6 * (reduced() ? 0 : globalBeat)));
     const aspect = width / height;
     gl.uniform2f(C.u.uAspect, aspect >= 1 ? aspect : 1, aspect >= 1 ? 1 : 1 / aspect);
     gl.uniform2f(C.u.uCenter, 0.5, 0.5 + bob * 0.1);
@@ -1066,7 +1176,7 @@
   }
 
   function start() {
-    if (raf || lost || document.hidden || reduced()) return;
+    if (raf || lost || failed || document.hidden || reduced()) return;
     last = 0;
     raf = requestAnimationFrame(frame);
   }
@@ -1102,6 +1212,8 @@
     initGL();
   } catch (err) {
     console.error(err);
+    failed = true;
+    stop();
     return startFallback();
   }
   root.classList.add('ready');
